@@ -1,6 +1,14 @@
-import { useEffect, useRef, useCallback, useState } from "react";
-import { MessageType } from "../types/messages";
-import type { MeterEventData, TAMotionData, WSMessage } from "../types/messages";
+import { useCallback, useEffect, useRef } from "react";
+import type { WSMessage } from "../types/messages";
+import {
+  ARC_MAX,
+  ARC_MIN,
+  RAW_SCALE,
+  SET_ANGLE,
+  TA_SCALE,
+  useMeterSignal,
+} from "../hooks/useMeterSignal";
+import { degToRad } from "../utils";
 
 interface MeterDisplayProps {
   subscribe: (type: string, handler: (msg: WSMessage) => void) => () => void;
@@ -12,22 +20,9 @@ interface MeterDisplayProps {
   onSmoothingChange: (v: number) => void;
 }
 
-// Physics constants
-const SET_ANGLE = -12; // degrees — the "SET" position
-const ARC_MIN = -65;
-const ARC_MAX = 65;
-const TA_SCALE = 10;
-// Converts raw ADC delta to degrees: degrees = delta * sensitivity * RAW_SCALE
-// Tuned so that at sensitivity=16, a ~30K ADC change ≈ 25° deflection
-const RAW_SCALE = 0.00005;
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function degToRad(deg: number): number {
-  return (deg * Math.PI) / 180;
-}
+const SENSITIVITY_STEPS = [1, 2, 4, 8, 16, 32, 64, 128];
+const SMOOTHING_STEPS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+const TONE_ARM_STEPS = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
 
 export default function MeterDisplay({
   subscribe,
@@ -39,43 +34,45 @@ export default function MeterDisplay({
   onSmoothingChange,
 }: MeterDisplayProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const dataRef = useRef<MeterEventData | null>(null);
-  const rawBaselineRef = useRef<number | null>(null); // SET reference in raw ADC units
-  const displayedAngleRef = useRef(SET_ANGLE);
   const animRef = useRef<number>(0);
-  const [hwConnected, setHwConnected] = useState(false);
-  const [samples, setSamples] = useState(0);
-  const [rawSignalDisplay, setRawSignalDisplay] = useState(0);
-  const [needleAction, setNeedleAction] = useState("idle");
-  const [taMotion, setTaMotion] = useState<TAMotionData | null>(null);
-
-  // Subscribe to meter events
-  useEffect(() => {
-    return subscribe(MessageType.METER_EVENT, (msg: WSMessage) => {
-      const d = msg.data as unknown as MeterEventData;
-      dataRef.current = d;
-      setHwConnected(d.hardwareConnected ?? false);
-      setSamples(d.samplesReceived ?? 0);
-      setRawSignalDisplay(d.rawSignal ?? 0);
-      setNeedleAction(d.needleAction ?? "idle");
-      if (d.taMotion) setTaMotion(d.taMotion);
-
-      // Auto-capture first raw signal as baseline (so needle starts at SET)
-      const raw = d.rawSignal ?? 0;
-      if (rawBaselineRef.current === null && raw > 0) {
-        rawBaselineRef.current = raw;
-      }
-    });
-  }, [subscribe]);
+  const {
+    displayedAngle,
+    hwConnected,
+    samples,
+    rawSignalDisplay,
+    needleAction,
+    taMotion,
+    handleSet: resetBaseline,
+  } = useMeterSignal(subscribe, sensitivity, toneArm, smoothing);
 
   const handleSet = useCallback(() => {
-    const raw = dataRef.current?.rawSignal ?? 0;
-    if (raw > 0) {
-      rawBaselineRef.current = raw;          // reset baseline
-      onToneArmChange(2.0);                  // reset TA to neutral
-      displayedAngleRef.current = SET_ANGLE; // snap needle to SET
-    }
-  }, [onToneArmChange]);
+    resetBaseline();
+    onToneArmChange(2.0);
+  }, [onToneArmChange, resetBaseline]);
+
+  const adjustSensitivity = useCallback((delta: number) => {
+    const idx = SENSITIVITY_STEPS.findIndex((value) => value >= sensitivity);
+    const safeIdx = idx === -1 ? SENSITIVITY_STEPS.length - 1 : idx;
+    const nextIdx = Math.max(0, Math.min(SENSITIVITY_STEPS.length - 1, safeIdx + delta));
+    const next = SENSITIVITY_STEPS[nextIdx];
+    onSensitivityChange(next);
+  }, [sensitivity, onSensitivityChange]);
+
+  const adjustSmoothing = useCallback((delta: number) => {
+    const idx = SMOOTHING_STEPS.findIndex((value) => value >= smoothing);
+    const safeIdx = idx === -1 ? SMOOTHING_STEPS.length - 1 : idx;
+    const nextIdx = Math.max(0, Math.min(SMOOTHING_STEPS.length - 1, safeIdx + delta));
+    const next = SMOOTHING_STEPS[nextIdx];
+    onSmoothingChange(next);
+  }, [smoothing, onSmoothingChange]);
+
+  const adjustToneArm = useCallback((delta: number) => {
+    const idx = TONE_ARM_STEPS.findIndex((value) => value >= toneArm);
+    const safeIdx = idx === -1 ? TONE_ARM_STEPS.length - 1 : idx;
+    const nextIdx = Math.max(0, Math.min(TONE_ARM_STEPS.length - 1, safeIdx + delta));
+    const next = TONE_ARM_STEPS[nextIdx];
+    onToneArmChange(next);
+  }, [toneArm, onToneArmChange]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -83,202 +80,191 @@ export default function MeterDisplay({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const data = dataRef.current;
-    const smoothed = data?.rawSignal ?? rawBaselineRef.current ?? 0;
-    const unfiltered = data?.rawUnfiltered ?? smoothed;
-    const baseline = rawBaselineRef.current ?? smoothed;
-
-    // Blend between raw and smoothed signal based on smoothing setting (0-100)
-    const blend = smoothing / 100;
-    const raw = unfiltered + (smoothed - unfiltered) * blend;
-
-    // Per-frame physics: needle follows raw signal (inverted)
-    // Squeeze → raw drops → delta positive → needle goes right (FALL)
-    // Release → raw rises → delta negative → needle goes left (RISE)
-    const delta = baseline - raw;
-    const amplifiedDelta = delta * sensitivity * RAW_SCALE;
-    const taOffset = (toneArm - 2.0) * TA_SCALE;
-    const targetAngle = SET_ANGLE + amplifiedDelta + taOffset;
-    const clamped = clamp(targetAngle, ARC_MIN, ARC_MAX);
-    // Damping: 0.02 (snappy) at smoothing=0 → 0.25 (smooth) at smoothing=100
-    const damping = 0.02 + blend * 0.23;
-    displayedAngleRef.current +=
-      (clamped - displayedAngleRef.current) * damping;
-
-    const displayedAngle = displayedAngleRef.current;
-
     // Canvas sizing (use CSS dimensions)
     const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.parentElement!.getBoundingClientRect();
-    const w = rect.width;
-    const h = rect.width * 0.65; // aspect ratio for meter face
+    const rect = canvas.parentElement?.getBoundingClientRect() ?? canvas.getBoundingClientRect();
+    const w = Math.max(1, Math.floor(rect.width));
+    const measuredH = rect.height > 0 ? rect.height : rect.width * 0.58;
+    const h = Math.max(300, Math.min(560, Math.floor(measuredH)));
 
     if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
+      canvas.width = Math.max(1, Math.floor(w * dpr));
+      canvas.height = Math.max(1, Math.floor(h * dpr));
       canvas.style.width = `${w}px`;
       canvas.style.height = `${h}px`;
-      ctx.scale(dpr, dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
     // Clear
     ctx.clearRect(0, 0, w, h);
 
-    // Background
-    ctx.fillStyle = "#0a0a0f";
+    const frameInset = 2;
+    const frameX = frameInset;
+    const frameY = frameInset;
+    const frameW = w - frameInset * 2;
+    const frameH = h - frameInset * 2;
+
+    // Background shell
+    const bg = ctx.createLinearGradient(0, 0, w, 0);
+    bg.addColorStop(0, "#030b20");
+    bg.addColorStop(0.5, "#030816");
+    bg.addColorStop(1, "#02050f");
+    ctx.fillStyle = bg;
     ctx.beginPath();
-    ctx.roundRect(0, 0, w, h, 8);
+    ctx.roundRect(frameX, frameY, frameW, frameH, 12);
     ctx.fill();
 
-    const cx = w / 2;
-    const pivotY = h - 20;
-    const needleLen = h * 0.72;
+    // Subtle inner frame
+    ctx.strokeStyle = "rgba(90, 216, 217, 0.22)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.roundRect(frameX + 1.5, frameY + 1.5, frameW - 3, frameH - 3, 11);
+    ctx.stroke();
 
-    // Draw arc with color zones
-    const arcRadius = needleLen + 8;
+    const edgePadding = 18;
+    const paintPadding = 14;
+    const maxNeedleStroke = 14;
+    const margin = Math.max(12, paintPadding + 2);
+    const cx = w / 2;
+    // Keep the needle origin further below the frame so less lower needle is visible.
+    const pivotY = h + Math.max(56, h * 0.15);
+    const arcAngleCosLimit = Math.max(
+      Math.abs(Math.cos(degToRad(ARC_MIN - 90))),
+      Math.abs(Math.cos(degToRad(ARC_MAX - 90))),
+    );
+    const arcRadiusByWidth = (w - 2 * edgePadding) / (2 * arcAngleCosLimit);
+    // Hard-cap by top clearance so the upper arc never clips and has clear breathing room.
+    const topHeadspace = 44;
+    const arcRadiusByTop = pivotY - (frameY + topHeadspace);
+    const arcRadius = Math.max(56, Math.min(arcRadiusByWidth * 0.95, arcRadiusByTop) - 4);
+    const needleLen = Math.max(20, arcRadius - maxNeedleStroke);
     const arcCenterY = pivotY;
 
-    // Color zones (angles from vertical, negative = left/rise, positive = right/fall)
-    const zones = [
-      { from: ARC_MIN, to: -35, color: "#ef4444" }, // extreme rise (red)
-      { from: -35, to: -20, color: "#eab308" }, // moderate rise (yellow)
-      { from: -20, to: -5, color: "#22c55e" }, // near SET (green)
-      { from: -5, to: 10, color: "#22c55e" }, // SET zone (green)
-      { from: 10, to: 30, color: "#eab308" }, // moderate fall (yellow)
-      { from: 30, to: 50, color: "#ef4444" }, // fall (red)
-      { from: 50, to: ARC_MAX, color: "#dc2626" }, // extreme fall (dark red)
-    ];
+    // Keep any anti-aliasing overhang from bleeding outside the frame.
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(frameX + 0.5, frameY + 0.5, frameW - 1, frameH - 1, 11);
+    ctx.clip();
 
-    for (const zone of zones) {
-      const startRad = degToRad(zone.from - 90);
-      const endRad = degToRad(zone.to - 90);
-      ctx.beginPath();
-      ctx.arc(cx, arcCenterY, arcRadius, startRad, endRad);
-      ctx.strokeStyle = zone.color;
-      ctx.lineWidth = 4;
-      ctx.globalAlpha = 0.3;
-      ctx.stroke();
-      ctx.globalAlpha = 1.0;
-    }
+    // Thin full guide arc
+    ctx.beginPath();
+    ctx.arc(cx, arcCenterY, arcRadius, degToRad(ARC_MIN - 90), degToRad(ARC_MAX - 90));
+    ctx.strokeStyle = "rgba(206, 214, 227, 0.65)";
+    ctx.lineWidth = 3.2;
+    ctx.lineCap = "round";
+    ctx.stroke();
 
-    // Tick marks at 5° intervals
+    // Main highlighted arc (clean white sweep, like the reference)
+    ctx.beginPath();
+    ctx.arc(cx, arcCenterY, arcRadius, degToRad(ARC_MIN - 90), degToRad(14 - 90));
+    ctx.strokeStyle = "rgba(233, 239, 249, 0.95)";
+    ctx.lineWidth = 14;
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    // Ticks
     for (let deg = ARC_MIN; deg <= ARC_MAX; deg += 5) {
       const isMajor = deg % 10 === 0;
       const rad = degToRad(deg - 90);
-      const innerR = arcRadius - (isMajor ? 14 : 8);
-      const outerR = arcRadius - 2;
+      const innerR = arcRadius - (isMajor ? 42 : 28);
+      const outerR = arcRadius - 16;
 
       ctx.beginPath();
-      ctx.moveTo(
-        cx + innerR * Math.cos(rad),
-        arcCenterY + innerR * Math.sin(rad),
-      );
-      ctx.lineTo(
-        cx + outerR * Math.cos(rad),
-        arcCenterY + outerR * Math.sin(rad),
-      );
-      ctx.strokeStyle = isMajor ? "#6b7280" : "#374151";
-      ctx.lineWidth = isMajor ? 1.5 : 0.8;
+      ctx.moveTo(cx + innerR * Math.cos(rad), arcCenterY + innerR * Math.sin(rad));
+      ctx.lineTo(cx + outerR * Math.cos(rad), arcCenterY + outerR * Math.sin(rad));
+      ctx.strokeStyle = isMajor ? "rgba(218, 225, 236, 0.86)" : "rgba(170, 181, 199, 0.7)";
+      ctx.lineWidth = isMajor ? 5 : 2.8;
+      ctx.lineCap = "round";
       ctx.stroke();
     }
 
-    // Labels along the arc
-    ctx.font = "bold 10px monospace";
+    // Labels
     ctx.textAlign = "center";
-    const labelR = arcRadius - 22;
-
-    // RISE (left side)
-    const riseRad = degToRad(-40 - 90);
-    ctx.fillStyle = "#ef4444";
-    ctx.fillText(
-      "RISE",
-      cx + labelR * Math.cos(riseRad),
-      arcCenterY + labelR * Math.sin(riseRad),
-    );
-
-    // SET (center-left, near SET_ANGLE)
+    ctx.font = "600 16px Sora, 'Avenir Next', sans-serif";
+    ctx.fillStyle = "rgba(202, 213, 227, 0.9)";
+    const labelR = Math.max(30, arcRadius - Math.max(48, margin * 3.2));
+    const riseRad = degToRad(-43 - 90);
     const setRad = degToRad(SET_ANGLE - 90);
-    ctx.fillStyle = "#22c55e";
-    ctx.fillText(
-      "SET",
-      cx + labelR * Math.cos(setRad),
-      arcCenterY + labelR * Math.sin(setRad),
-    );
-
-    // FALL (right side)
-    const fallRad = degToRad(30 - 90);
-    ctx.fillStyle = "#eab308";
-    ctx.fillText(
-      "FALL",
-      cx + labelR * Math.cos(fallRad),
-      arcCenterY + labelR * Math.sin(fallRad),
-    );
-
-    // TEST (far right)
-    const testRad = degToRad(55 - 90);
-    ctx.fillStyle = "#ef4444";
-    ctx.fillText(
-      "TEST",
-      cx + labelR * Math.cos(testRad),
-      arcCenterY + labelR * Math.sin(testRad),
-    );
-
-    // Needle shadow
-    const needleRad = degToRad(displayedAngle - 90);
-    ctx.beginPath();
-    ctx.moveTo(cx + 2, pivotY + 2);
-    ctx.lineTo(
-      cx + 2 + needleLen * Math.cos(needleRad),
-      pivotY + 2 + needleLen * Math.sin(needleRad),
-    );
-    ctx.strokeStyle = "rgba(0,0,0,0.4)";
-    ctx.lineWidth = 3;
-    ctx.lineCap = "round";
-    ctx.stroke();
+    const fallRad = degToRad(31 - 90);
+    const testRad = degToRad(56 - 90);
+    ctx.fillText("RISE", cx + labelR * Math.cos(riseRad), arcCenterY + labelR * Math.sin(riseRad));
+    ctx.fillText("SET", cx + labelR * Math.cos(setRad), arcCenterY + labelR * Math.sin(setRad));
+    ctx.fillText("FALL", cx + labelR * Math.cos(fallRad), arcCenterY + labelR * Math.sin(fallRad));
+    ctx.fillText("TEST", cx + labelR * Math.cos(testRad), arcCenterY + labelR * Math.sin(testRad));
 
     // Needle
+    const needleRad = degToRad(displayedAngle - 90);
+    const x2 = cx + needleLen * Math.cos(needleRad);
+    const y2 = pivotY + needleLen * Math.sin(needleRad);
+
     ctx.beginPath();
-    ctx.moveTo(cx, pivotY);
-    ctx.lineTo(
-      cx + needleLen * Math.cos(needleRad),
-      pivotY + needleLen * Math.sin(needleRad),
-    );
-    ctx.strokeStyle = "#d1d5db";
-    ctx.lineWidth = 2;
+    ctx.moveTo(cx + 6, pivotY + 2);
+    ctx.lineTo(x2 + 6, y2 + 2);
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.42)";
+    ctx.lineWidth = 12;
     ctx.lineCap = "round";
     ctx.stroke();
 
-    // Pivot dot
     ctx.beginPath();
-    ctx.arc(cx, pivotY, 5, 0, Math.PI * 2);
-    ctx.fillStyle = "#6b7280";
-    ctx.fill();
+    ctx.moveTo(cx, pivotY);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = "#d9e0ec";
+    ctx.lineWidth = 11;
+    ctx.lineCap = "round";
+    ctx.stroke();
 
-    // Digital readouts
-    // TA (top-left)
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "#6b7280";
+    // Needle spine highlight
+    ctx.beginPath();
+    ctx.moveTo(cx - 2.3, pivotY - 0.4);
+    ctx.lineTo(x2 - 2.3, y2 - 0.4);
+    ctx.strokeStyle = "rgba(247, 250, 255, 0.92)";
+    ctx.lineWidth = 3.2;
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    // Pivot
+    if (pivotY < h - 6) {
+      ctx.beginPath();
+      ctx.arc(cx, pivotY, 10, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(188, 199, 216, 0.94)";
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(cx, pivotY, 4, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(230, 236, 246, 0.98)";
+      ctx.fill();
+    }
+
+    // Top readouts
+    const labelSize = Math.max(11, Math.min(14, w * 0.02));
+    const readoutSize = Math.max(34, Math.min(74, w * 0.086));
+    const readoutTop = Math.max(18, h * 0.09);
+    const readoutY = Math.max(readoutTop + readoutSize, Math.min(h * 0.34, h - margin - 10));
+    const labelY = Math.max(14, readoutTop - 7);
+
     ctx.textAlign = "left";
-    ctx.fillText("TA", 12, 18);
-    ctx.font = "bold 20px monospace";
-    ctx.fillStyle = "#e5e7eb";
-    ctx.fillText(toneArm.toFixed(1), 12, 40);
+    ctx.fillStyle = "rgba(176, 184, 203, 0.9)";
+    ctx.font = `600 ${labelSize}px Sora, 'Avenir Next', sans-serif`;
+    ctx.fillText("TA", margin, labelY);
+    ctx.fillStyle = "#e5ebf5";
+    ctx.font = `600 ${readoutSize}px Sora, 'Avenir Next', sans-serif`;
+    ctx.fillText(toneArm.toFixed(1), margin, readoutY);
 
-    // SENS (top-right)
-    ctx.font = "10px monospace";
-    ctx.fillStyle = "#6b7280";
     ctx.textAlign = "right";
-    ctx.fillText("SENS", w - 12, 18);
-    ctx.font = "bold 20px monospace";
-    ctx.fillStyle = "#e5e7eb";
-    ctx.fillText(String(sensitivity), w - 12, 40);
+    ctx.fillStyle = "rgba(176, 184, 203, 0.9)";
+    ctx.font = `600 ${labelSize}px Sora, 'Avenir Next', sans-serif`;
+    ctx.fillText("SENS", w - margin, labelY);
+    ctx.fillStyle = "#e5ebf5";
+    ctx.font = `600 ${readoutSize}px Sora, 'Avenir Next', sans-serif`;
+    ctx.fillText(String(sensitivity), w - margin, readoutY);
 
-    // Needle action (bottom center)
-    const action = data?.needleAction ?? "idle";
-    ctx.font = "bold 11px monospace";
-    ctx.fillStyle = "#9ca3af";
+    // Very subtle action text only
+    const action = needleAction ?? "idle";
     ctx.textAlign = "center";
-    ctx.fillText(action.replace(/_/g, " ").toUpperCase(), cx, h - 4);
+    ctx.font = "600 10px Sora, 'Avenir Next', sans-serif";
+    ctx.fillStyle = "rgba(170, 180, 197, 0.45)";
+    ctx.fillText(action.replace(/_/g, " ").toUpperCase(), cx, h - 14);
+
+    ctx.restore();
 
     animRef.current = requestAnimationFrame(draw);
   }, [sensitivity, toneArm, smoothing]);
@@ -290,10 +276,12 @@ export default function MeterDisplay({
   }, [draw]);
 
   return (
-    <div className="w-full h-full flex flex-col bg-gray-950 rounded-lg border border-gray-800">
+    <div className="w-full h-full flex flex-col ms-panel overflow-hidden">
       {/* Canvas */}
-      <div className="flex-1 min-h-0 p-2">
-        <canvas ref={canvasRef} className="w-full" />
+      <div className="px-0.5 pt-0.5 flex-1 min-h-0">
+        <div className="meter-canvas-wrap">
+          <canvas ref={canvasRef} className="w-full h-full" />
+        </div>
       </div>
 
       {/* Status bar */}
@@ -351,63 +339,44 @@ export default function MeterDisplay({
       </div>
 
       {/* Controls */}
-      <div className="px-3 pb-3 space-y-2">
-        {/* Sensitivity slider */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500 w-10">SENS</span>
-          <input
-            type="range"
-            min={1}
-            max={128}
-            value={sensitivity}
-            onChange={(e) => onSensitivityChange(Number(e.target.value))}
-            className="flex-1 h-1 accent-indigo-500"
-          />
-          <span className="text-xs text-white font-mono w-8 text-right">
-            {sensitivity}
-          </span>
-        </div>
+      <div className="px-3 pb-3">
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-stretch">
+          <div className="grid grid-cols-3 gap-2 flex-1">
+            <div className="rounded-md border border-cyan-300/20 bg-black/15 px-2 py-1.5">
+              <div className="text-[10px] text-gray-500 text-center tracking-[0.12em]">SENS</div>
+              <div className="flex items-center justify-between mt-1">
+                <button className="ms-mini-btn px-2.5 py-1.5" onClick={() => adjustSensitivity(-1)} aria-label="Decrease sensitivity">-</button>
+                <span className="text-white text-2xl font-semibold tabular-nums">{sensitivity}</span>
+                <button className="ms-mini-btn px-2.5 py-1.5" onClick={() => adjustSensitivity(1)} aria-label="Increase sensitivity">+</button>
+              </div>
+            </div>
 
-        {/* Smoothing slider */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500 w-10">SMOOTH</span>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            value={smoothing}
-            onChange={(e) => onSmoothingChange(Number(e.target.value))}
-            className="flex-1 h-1 accent-indigo-500"
-          />
-          <span className="text-xs text-white font-mono w-8 text-right">
-            {smoothing}%
-          </span>
-        </div>
+            <div className="rounded-md border border-cyan-300/20 bg-black/15 px-2 py-1.5">
+              <div className="text-[10px] text-gray-500 text-center tracking-[0.12em]">SMTH</div>
+              <div className="flex items-center justify-between mt-1">
+                <button className="ms-mini-btn px-2.5 py-1.5" onClick={() => adjustSmoothing(-1)} aria-label="Decrease smoothing">-</button>
+                <span className="text-white text-2xl font-semibold tabular-nums">{smoothing}%</span>
+                <button className="ms-mini-btn px-2.5 py-1.5" onClick={() => adjustSmoothing(1)} aria-label="Increase smoothing">+</button>
+              </div>
+            </div>
 
-        {/* Tone Arm slider */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-500 w-10">TA</span>
-          <input
-            type="range"
-            min={0}
-            max={6}
-            step={0.1}
-            value={toneArm}
-            onChange={(e) => onToneArmChange(Number(e.target.value))}
-            className="flex-1 h-1 accent-indigo-500"
-          />
-          <span className="text-xs text-white font-mono w-6 text-right">
-            {toneArm.toFixed(1)}
-          </span>
-        </div>
+            <div className="rounded-md border border-cyan-300/20 bg-black/15 px-2 py-1.5">
+              <div className="text-[10px] text-gray-500 text-center tracking-[0.12em]">TONE</div>
+              <div className="flex items-center justify-between mt-1">
+                <button className="ms-mini-btn px-2.5 py-1.5" onClick={() => adjustToneArm(-1)} aria-label="Decrease tone arm">-</button>
+                <span className="text-white text-2xl font-semibold tabular-nums">{toneArm.toFixed(1)}</span>
+                <button className="ms-mini-btn px-2.5 py-1.5" onClick={() => adjustToneArm(1)} aria-label="Increase tone arm">+</button>
+              </div>
+            </div>
+          </div>
 
-        {/* SET button */}
-        <button
-          onClick={handleSet}
-          className="w-full bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-bold py-1.5 rounded transition-colors"
-        >
-          SET
-        </button>
+          <button
+            onClick={handleSet}
+            className="ms-btn ms-btn-emerald py-2 lg:min-w-[9.5rem] lg:px-6"
+          >
+            SET
+          </button>
+        </div>
       </div>
     </div>
   );

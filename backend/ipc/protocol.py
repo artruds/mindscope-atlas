@@ -58,6 +58,8 @@ class MessageType(Enum):
     # Session recovery
     SESSION_RECOVER = "session.recover"
     SESSION_RECOVERED = "session.recovered"
+    # Charge
+    CHARGE_MAP = "charge.map"
     # Database
     DB_STATUS = "db.status"
     DB_STATUS_DATA = "db.status.data"

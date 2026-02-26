@@ -7,6 +7,8 @@ import type {
   ChatMessage,
 } from "../types/messages";
 import MicButton from "./MicButton";
+import ChatBubble from "./ChatBubble";
+import { formatTime } from "../utils";
 
 interface SessionPanelProps {
   connected: boolean;
@@ -26,41 +28,6 @@ const PHASE_COLORS: Record<string, string> = {
   END_RUDIMENTS: "bg-amber-600",
   COMPLETE: "bg-gray-500",
 };
-
-function formatTime(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-}
-
-function ChatBubble({ message }: { message: ChatMessage }) {
-  const isAuditor = message.speaker === "auditor";
-  return (
-    <div className={`flex ${isAuditor ? "justify-start" : "justify-end"}`}>
-      <div
-        className={`max-w-[80%] px-3 py-2 rounded-lg text-sm ${
-          isAuditor
-            ? "bg-gray-800 text-gray-100"
-            : "bg-indigo-600 text-white"
-        }`}
-      >
-        <p>{message.text}</p>
-        <div
-          className={`flex items-center gap-2 mt-1 text-[10px] ${
-            isAuditor ? "text-gray-500" : "text-indigo-200"
-          }`}
-        >
-          <span>{isAuditor ? "Auditor" : "PC"}</span>
-          {message.needleAction && (
-            <span className="opacity-70">
-              {message.needleAction.replace(/_/g, " ")}
-            </span>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 export default function SessionPanel({
   connected,
@@ -302,17 +269,18 @@ export default function SessionPanel({
   }, [stopAutoRecording]);
 
   const isActive = sessionState !== null && sessionState.phase !== "COMPLETE";
+  const selectedPc = profiles.find((pc) => pc.id === selectedPcId) ?? null;
 
   return (
     <div className="flex flex-col h-full gap-3">
       {/* Controls */}
-      <div className="bg-gray-900 rounded-lg p-3 border border-gray-800">
+      <div className="ms-panel p-4">
         <div className="flex items-center gap-3 mb-3">
           <select
             value={selectedPcId}
             onChange={(e) => onSelectPc(e.target.value)}
             disabled={isActive}
-            className="flex-1 bg-gray-800 text-white rounded px-3 py-1.5 border border-gray-700 text-sm disabled:opacity-50"
+            className="ms-select flex-1 min-w-0"
           >
             <option value="">Select PC...</option>
             {profiles.map((pc) => (
@@ -326,30 +294,30 @@ export default function SessionPanel({
             <button
               onClick={handleStart}
               disabled={!connected || !selectedPcId}
-              className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded text-sm font-medium transition-colors"
+              className="ms-btn ms-btn-emerald ms-pill min-w-36"
             >
-              Start
+              Start Session
             </button>
           ) : (
             <>
               {sessionState?.isPaused ? (
                 <button
                   onClick={handleResume}
-                  className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                  className="ms-btn ms-btn-primary ms-pill"
                 >
                   Resume
                 </button>
               ) : (
                 <button
                   onClick={handlePause}
-                  className="bg-amber-600 hover:bg-amber-500 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                  className="ms-btn ms-btn-warn ms-pill"
                 >
                   Pause
                 </button>
               )}
               <button
                 onClick={handleEnd}
-                className="bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-sm font-medium transition-colors"
+                className="ms-btn ms-btn-danger ms-pill"
               >
                 End
               </button>
@@ -361,7 +329,7 @@ export default function SessionPanel({
         {sessionState && (
           <div className="flex items-center gap-3">
             <span
-              className={`px-2 py-0.5 rounded text-xs font-medium text-white ${
+              className={`ms-chip ${
                 PHASE_COLORS[sessionState.phase] ?? "bg-gray-600"
               }`}
             >
@@ -376,21 +344,19 @@ export default function SessionPanel({
             {/* Toggles */}
             {isActive && (
               <div className="flex items-center gap-3">
-                <label className="flex items-center gap-1.5 text-[10px] text-gray-400 cursor-pointer select-none">
+                <label className="ms-toggle">
                   <input
                     type="checkbox"
                     checked={autoSend}
                     onChange={(e) => setAutoSend(e.target.checked)}
-                    className="accent-indigo-500 w-3 h-3"
                   />
                   Auto-Send
                 </label>
-                <label className="flex items-center gap-1.5 text-[10px] text-gray-400 cursor-pointer select-none">
+                <label className="ms-toggle">
                   <input
                     type="checkbox"
                     checked={autoRecord}
                     onChange={(e) => setAutoRecord(e.target.checked)}
-                    className="accent-emerald-500 w-3 h-3"
                   />
                   Auto-Record
                 </label>
@@ -408,16 +374,29 @@ export default function SessionPanel({
       </div>
 
       {/* Chat messages */}
-      <div className="flex-1 min-h-0 bg-gray-900 rounded-lg border border-gray-800 flex flex-col">
-        <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
-          {messages.length === 0 && !isActive ? (
-            <p className="text-gray-600 text-xs py-8 text-center">
-              No active session
-            </p>
-          ) : messages.length === 0 ? (
-            <p className="text-gray-600 text-xs py-8 text-center">
-              Session in progress...
-            </p>
+      <div className="flex-1 min-h-0 ms-panel flex flex-col">
+        <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2 ms-scroll">
+            {messages.length === 0 && !isActive ? (
+              <div className="h-full min-h-0 flex items-center justify-center">
+              <div className="ms-empty-state max-w-md w-full text-center px-6 py-8">
+                <p className="text-sm text-cyan-100 font-semibold tracking-wide">Ready To Begin</p>
+                <p className="text-xs text-gray-400 mt-2">
+                  {selectedPc
+                    ? `Profile selected: ${selectedPc.firstName} ${selectedPc.lastName}`
+                    : "Select a PC profile and press Start Session to begin auditing."}
+                </p>
+                <div className="mt-4 flex items-center justify-center gap-2 text-[10px] text-gray-400 uppercase tracking-[0.2em]">
+                  <span className={`w-2 h-2 rounded-full ${connected ? "bg-emerald-400" : "bg-red-400"}`} />
+                  {connected ? "Live connection active" : "Backend disconnected"}
+                </div>
+              </div>
+            </div>
+            ) : messages.length === 0 ? (
+            <div className="h-full min-h-0 flex items-center justify-center">
+              <p className="text-gray-400 text-xs py-8 text-center tracking-wide animate-pulse">
+                Session in progress...
+              </p>
+            </div>
           ) : (
             messages.map((msg, i) => <ChatBubble key={i} message={msg} />)
           )}
@@ -444,7 +423,7 @@ export default function SessionPanel({
                 <span className="text-xs text-red-400 flex-1">Recording...</span>
                 <button
                   onClick={handleSubmitRecording}
-                  className="bg-amber-600 hover:bg-amber-500 text-white px-3 py-1 rounded-full text-xs font-medium transition-colors"
+                  className="ms-btn ms-btn-warn text-xs px-3 py-1 rounded-full"
                 >
                   Submit Recording
                 </button>
@@ -464,7 +443,7 @@ export default function SessionPanel({
                   }
                 }}
                 placeholder={autoSend ? "Auto-Send ON — paste or dictate..." : "Type PC's response..."}
-                className={`flex-1 bg-gray-800 text-white rounded-full px-4 py-1.5 border text-sm focus:outline-none ${
+                className={`ms-input flex-1 rounded-full px-4 py-1.5 text-sm ${
                   isAutoRecording
                     ? "border-red-600/50"
                     : autoSend
@@ -477,7 +456,7 @@ export default function SessionPanel({
               <button
                 onClick={handlePcInput}
                 disabled={!pcInput.trim()}
-                className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-full text-sm font-medium transition-colors"
+                className="ms-btn ms-btn-primary rounded-full px-4 py-1.5 text-sm"
               >
                 Send
               </button>

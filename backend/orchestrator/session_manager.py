@@ -18,6 +18,11 @@ if TYPE_CHECKING:
 log = logging.getLogger("mindscope.session")
 
 
+class SessionMode:
+    STRUCTURED = "structured"
+    CONVERSATIONAL = "conversational"
+
+
 class SessionPhase:
     SETUP = "SETUP"
     START_RUDIMENTS = "START_RUDIMENTS"
@@ -54,18 +59,23 @@ class SessionManager:
         db: DatabaseManager,
         broadcast_fn: Callable[[Message], Awaitable[None]],
         ai_auditor: AIAuditor | None = None,
+        session_mode: str = SessionMode.STRUCTURED,
     ) -> None:
         self.pc_id = pc_id
         self.session_id = session_id
         self.db = db
         self.broadcast_fn = broadcast_fn
         self.ai_auditor = ai_auditor
+        self.session_mode = session_mode
 
         self.phase = SessionPhase.SETUP
         self.r3r = R3RStateMachine()
         self.current_command = ""
         self.turn_number = 0
         self.transcript: list[dict] = []
+
+        # Charge tracker (set by router after creation)
+        self.charge_tracker = None
 
         # Timer
         self._start_time = 0.0
@@ -106,6 +116,15 @@ class SessionManager:
 
         # Transcript entries already persisted individually via _persist_entry
 
+        # Broadcast charge map in conversational mode
+        if self.session_mode == SessionMode.CONVERSATIONAL and self.charge_tracker:
+            charge_map = self.charge_tracker.get_charge_map()
+            if charge_map:
+                await self.broadcast_fn(Message(
+                    type=MessageType.CHARGE_MAP.value,
+                    data={"entries": charge_map, "sessionId": self.session_id},
+                ))
+
         await self._broadcast_state()
         log.info("Session %s ended (%.0fs)", self.session_id, elapsed)
 
@@ -135,6 +154,14 @@ class SessionManager:
         tone_arm = meter_event.tone_arm if meter_event else None
         sensitivity = meter_event.sensitivity if meter_event else None
 
+        # Get charge analysis before advancing (for PC's message display)
+        charge_score = None
+        body_movement = None
+        if self.charge_tracker:
+            charge_analysis = self.charge_tracker.get_analysis()
+            charge_score = charge_analysis.get("chargeScore", 0)
+            body_movement = charge_analysis.get("bodyMovement", False)
+
         # Record PC's response
         self._add_transcript("pc", text, needle_action, tone_arm)
         await self._persist_entry(self.transcript[-1])
@@ -145,13 +172,18 @@ class SessionManager:
             needle_action=needle_action.value if needle_action else None,
             tone_arm=tone_arm,
             sensitivity=sensitivity,
+            charge_score=charge_score,
+            body_movement=body_movement,
         )
 
         # Determine next command based on phase
         if self.phase == SessionPhase.START_RUDIMENTS:
             await self._advance_start_rudiments(text, meter_event)
         elif self.phase == SessionPhase.PROCESSING:
-            await self._advance_processing(text, meter_event)
+            if self.session_mode == SessionMode.CONVERSATIONAL:
+                await self._advance_conversational(text, meter_event)
+            else:
+                await self._advance_processing(text, meter_event)
         elif self.phase == SessionPhase.END_RUDIMENTS:
             await self._advance_end_rudiments(text, meter_event)
 
@@ -220,6 +252,37 @@ class SessionManager:
             data={"r3rState": new_state.value, "command": command},
         ))
 
+    async def _advance_conversational(
+        self, text: str, meter: MeterEvent | None
+    ) -> None:
+        """Advance in conversational mode — free-form AI chat with charge data."""
+        is_ai = False
+        charge_data = None
+        if self.charge_tracker:
+            charge_data = self.charge_tracker.get_analysis()
+
+        if self.ai_auditor:
+            try:
+                meter_data = meter.to_dict() if meter else None
+                session_info = self.get_state()
+                ai_response = await self.ai_auditor.respond_conversational(
+                    pc_text=text,
+                    meter_data=meter_data,
+                    session_info=session_info,
+                    charge_data=charge_data,
+                )
+                self.current_command = ai_response
+                is_ai = True
+            except Exception:
+                log.exception("AI auditor conversational error, falling back to default")
+                self.current_command = "Thank you. Tell me more about that."
+        else:
+            self.current_command = "Thank you. Tell me more about that."
+
+        self._add_transcript("auditor", self.current_command)
+        await self._persist_entry(self.transcript[-1])
+        await self._broadcast_chat("auditor", self.current_command, is_ai_generated=is_ai)
+
     async def _advance_end_rudiments(
         self, text: str, meter: MeterEvent | None
     ) -> None:
@@ -247,13 +310,14 @@ class SessionManager:
         return {
             "phase": self.phase,
             "step": self.current_command,
-            "r3rState": self.r3r.state.value if self.phase == SessionPhase.PROCESSING else None,
+            "r3rState": self.r3r.state.value if self.phase == SessionPhase.PROCESSING and self.session_mode == SessionMode.STRUCTURED else None,
             "elapsed": self._elapsed_seconds(),
             "isPaused": self.is_paused,
             "pcId": self.pc_id,
             "sessionId": self.session_id,
             "currentCommand": self.current_command,
             "turnNumber": self.turn_number,
+            "sessionMode": self.session_mode,
         }
 
     def _elapsed_seconds(self) -> float:
@@ -311,6 +375,8 @@ class SessionManager:
         tone_arm: float | None = None,
         sensitivity: float | None = None,
         is_ai_generated: bool = False,
+        charge_score: int | None = None,
+        body_movement: bool | None = None,
     ) -> None:
         """Broadcast a CHAT_MESSAGE to all clients."""
         data: dict = {
@@ -323,9 +389,17 @@ class SessionManager:
             "sensitivity": sensitivity,
             "isAiGenerated": is_ai_generated,
         }
+        # Include charge data if present
+        if charge_score is not None:
+            data["chargeScore"] = charge_score
+        if body_movement is not None:
+            data["bodyMovement"] = body_movement
         # Mark auditor questions with epoch timestamp for signal chart markers
         if speaker == "auditor":
             data["questionDroppedAt"] = time.time()
+            # Notify charge tracker about the question being dropped
+            if self.charge_tracker:
+                self.charge_tracker.question_dropped(text)
         await self.broadcast_fn(Message(
             type=MessageType.CHAT_MESSAGE.value,
             data=data,

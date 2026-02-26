@@ -60,8 +60,7 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
 
   return (
     <div className="max-w-2xl mx-auto p-6 space-y-6">
-      <h1 className="text-2xl font-bold text-white">MindScope v2</h1>
-      <p className="text-gray-400 text-sm">Phase 1 — Foundation</p>
+      <h1 className="text-2xl font-bold text-white">Mindscope Atlas</h1>
 
       {/* Status indicators */}
       <div className="grid grid-cols-2 gap-4">
@@ -79,7 +78,7 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
       </div>
 
       {/* Create PC form */}
-      <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+      <div className="ms-panel p-4">
         <h2 className="text-lg font-semibold text-white mb-3">Create PC Profile</h2>
         <div className="flex gap-3">
           <input
@@ -88,7 +87,7 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
             value={firstName}
             onChange={(e) => setFirstName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-            className="flex-1 bg-gray-800 text-white rounded px-3 py-2 border border-gray-700 focus:border-indigo-500 focus:outline-none"
+            className="ms-input flex-1"
           />
           <input
             type="text"
@@ -96,12 +95,12 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
             value={lastName}
             onChange={(e) => setLastName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-            className="flex-1 bg-gray-800 text-white rounded px-3 py-2 border border-gray-700 focus:border-indigo-500 focus:outline-none"
+            className="ms-input flex-1"
           />
           <button
             onClick={handleCreate}
             disabled={!connected || !firstName.trim()}
-            className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded font-medium transition-colors"
+            className="ms-btn ms-btn-primary"
           >
             Create
           </button>
@@ -109,7 +108,7 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
       </div>
 
       {/* PC list */}
-      <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+      <div className="ms-panel p-4">
         <h2 className="text-lg font-semibold text-white mb-3">
           PC Profiles {profiles.length > 0 && <span className="text-gray-500">({profiles.length})</span>}
         </h2>
@@ -120,7 +119,7 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
             {profiles.map((pc) => (
               <li
                 key={pc.id}
-                className="flex items-center justify-between bg-gray-800 rounded px-3 py-2"
+                className="flex items-center justify-between bg-gray-800 rounded px-3 py-2 border border-gray-700"
               >
                 <div>
                   <span className="text-white font-medium">
@@ -132,7 +131,7 @@ export default function StatusPanel({ connected, send, subscribe }: StatusPanelP
                 </div>
                 <button
                   onClick={() => handleDelete(pc.id)}
-                  className="text-red-400 hover:text-red-300 text-sm transition-colors"
+                  className="ms-btn ms-btn-danger text-xs px-3 py-1"
                 >
                   Delete
                 </button>
@@ -157,7 +156,7 @@ function StatusCard({
   detail?: string;
 }) {
   return (
-    <div className="bg-gray-900 rounded-lg p-4 border border-gray-800">
+    <div className="ms-panel p-4">
       <div className="flex items-center gap-2 mb-1">
         <div className={`w-2 h-2 rounded-full ${ok ? "bg-emerald-400" : "bg-red-400"}`} />
         <span className="text-gray-400 text-sm">{label}</span>

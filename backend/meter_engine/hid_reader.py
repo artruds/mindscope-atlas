@@ -10,10 +10,10 @@ and push processed samples to an asyncio queue.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import os
+import queue
 import threading
 import time
 
@@ -29,6 +29,7 @@ DT = 1.0 / POLL_RATE_HZ
 # Baseline EMA alpha (~30s window at 62Hz)
 BASELINE_ALPHA = 1.0 / (30 * POLL_RATE_HZ)
 BASELINE_MIN_SAMPLES = 120
+RECONNECT_DELAY_SECONDS = 0.75
 
 # Needle scale: units of filtered deviation = full scale at sensitivity 1
 # Frontend stacks its own sensitivity (1-32) * SCALE (0.08) * SIGNAL_RANGE (300)
@@ -121,7 +122,9 @@ class HIDMeterReader:
         self.vid = vid
         self.pid = pid
         # Queue items: (timestamp, position, tone_arm, smooth_signal, raw_adc)
-        self.queue: asyncio.Queue[tuple[float, float, float, float, float]] = asyncio.Queue(
+        # Use threading.Queue because this reader pushes samples from a background
+        # thread while the broadcaster consumes them in the asyncio loop.
+        self.queue: queue.Queue[tuple[float, float, float, float, float]] = queue.Queue(
             maxsize=1000
         )
         self._running = False
@@ -187,46 +190,58 @@ class HIDMeterReader:
         """Background thread: open HID device and read reports."""
         import hid
 
-        device = hid.Device(self.vid, self.pid)
-        log.info("HID device opened")
-
-        try:
-            while self._running:
-                try:
-                    data = device.read(64, timeout=100)
-                except hid.HIDException:
-                    # "Success" exception on macOS for empty/timeout reads
-                    continue
-
-                if not data or len(data) < 5:
-                    continue
-
-                now = time.monotonic()
-                reading = self._parse_report(data)
-                if reading is None:
-                    continue
-
-                processed = self._process_signal(reading, now)
-                if processed is None:
-                    continue
-
-                ts, position, ta, raw_smooth, raw_adc = processed
-                try:
-                    self.queue.put_nowait((ts, position, ta, raw_smooth, raw_adc))
-                except asyncio.QueueFull:
-                    try:
-                        self.queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    self.queue.put_nowait((ts, position, ta, raw_smooth, raw_adc))
-        except Exception:
-            log.exception("HID read loop fatal error")
-        finally:
+        while self._running:
             try:
-                device.close()
+                device = hid.Device(self.vid, self.pid)
+            except Exception as exc:
+                log.warning("Unable to open HID device (%s), retrying in %.2fs", exc, RECONNECT_DELAY_SECONDS)
+                time.sleep(RECONNECT_DELAY_SECONDS)
+                continue
+
+            log.info("HID device opened")
+
+            try:
+                while self._running:
+                    try:
+                        data = device.read(64, timeout=100)
+                    except hid.HIDException:
+                        # "Success" exception on macOS for empty/timeout reads
+                        continue
+
+                    if not data or len(data) < 5:
+                        continue
+
+                    now = time.monotonic()
+                    reading = self._parse_report(data)
+                    if reading is None:
+                        continue
+
+                    processed = self._process_signal(reading, now)
+                    if processed is None:
+                        continue
+
+                    ts, position, ta, raw_smooth, raw_adc = processed
+                    try:
+                        self.queue.put_nowait((ts, position, ta, raw_smooth, raw_adc))
+                    except queue.Full:
+                        try:
+                            self.queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self.queue.put_nowait((ts, position, ta, raw_smooth, raw_adc))
             except Exception:
-                pass
-            log.info("HID device closed")
+                log.exception("HID read loop fatal error")
+            finally:
+                try:
+                    device.close()
+                except Exception:
+                    pass
+                log.info("HID device closed")
+
+            if self._running:
+                time.sleep(RECONNECT_DELAY_SECONDS)
+
+        log.info("HID read thread exiting")
 
     def _parse_report(self, data: bytes) -> float | None:
         """Parse a raw HID report → converted ADC value."""

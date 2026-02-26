@@ -1,6 +1,7 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { MessageType } from "../types/messages";
 import type { MeterEventData, ChatMessage, WSMessage } from "../types/messages";
+import { clamp, formatSignal } from "../utils";
 
 interface SignalMonitorProps {
   subscribe: (type: string, handler: (msg: WSMessage) => void) => () => void;
@@ -37,10 +38,6 @@ interface QuestionMarker {
 interface RecordingMarker {
   type: "start" | "end";
   time: number; // counter-based time (same as DataPoint.time)
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
 }
 
 const ANNOTATION_COLORS: Record<string, string> = {
@@ -103,6 +100,10 @@ export default function SignalMonitor({
   const viewOffsetRef = useRef(0);      // points back from latest (0 = live edge)
   const viewWindowRef = useRef(60 * POINTS_PER_SECOND); // visible points (default 60s)
   const dragRef = useRef<{ startX: number; startOffset: number } | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [softness, setSoftness] = useState(45);
+  const softnessRef = useRef(45);
+  softnessRef.current = softness;
 
   // Rolling min/max for all-time tracking
   const allTimeMinRef = useRef<number>(Infinity);
@@ -200,7 +201,7 @@ export default function SignalMonitor({
       if (canvas.width !== targetW || canvas.height !== targetH) {
         canvas.width = targetW;
         canvas.height = targetH;
-        ctx.scale(dpr, dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         canvas.style.width = `${rect.width}px`;
         canvas.style.height = `${rect.height}px`;
       }
@@ -214,8 +215,32 @@ export default function SignalMonitor({
     // Clear
     ctx.clearRect(0, 0, w, h);
 
-    // Background
-    ctx.fillStyle = "#0a0a0f";
+    // Background: layered meter-like gradient for a richer, cohesive look
+    const baseBg = ctx.createLinearGradient(0, 0, w, 0);
+    baseBg.addColorStop(0, "#030b20");
+    baseBg.addColorStop(0.5, "#030816");
+    baseBg.addColorStop(1, "#02050f");
+    ctx.fillStyle = baseBg;
+    ctx.fillRect(0, 0, w, h);
+
+    const glowLeft = ctx.createRadialGradient(w * 0.18, h * 0.15, 10, w * 0.18, h * 0.15, w * 0.75);
+    glowLeft.addColorStop(0, "rgba(34, 112, 168, 0.08)");
+    glowLeft.addColorStop(1, "rgba(41, 126, 182, 0)");
+    ctx.fillStyle = glowLeft;
+    ctx.fillRect(0, 0, w, h);
+
+    const glowRight = ctx.createRadialGradient(w * 0.85, h * 0.84, 10, w * 0.85, h * 0.84, w * 0.65);
+    glowRight.addColorStop(0, "rgba(82, 152, 112, 0.05)");
+    glowRight.addColorStop(1, "rgba(95, 168, 123, 0)");
+    ctx.fillStyle = glowRight;
+    ctx.fillRect(0, 0, w, h);
+
+    // Subtle top-to-bottom vignette to keep the chart in the same darker family as the meter.
+    const vignette = ctx.createLinearGradient(0, 0, 0, h);
+    vignette.addColorStop(0, "rgba(0, 0, 0, 0.12)");
+    vignette.addColorStop(0.45, "rgba(0, 0, 0, 0.04)");
+    vignette.addColorStop(1, "rgba(0, 0, 0, 0.18)");
+    ctx.fillStyle = vignette;
     ctx.fillRect(0, 0, w, h);
 
     const margin = 80; // left margin for Y labels
@@ -266,9 +291,13 @@ export default function SignalMonitor({
     const bufferStartTime = buffer[0].time;
     const bufferEndTime = buffer[buffer.length - 1].time;
     const timeSpan = Math.max(bufferEndTime - bufferStartTime, 1);
+    const softnessRatio = clamp(softnessRef.current / 100, 0, 1);
+    const smoothAlpha = 1 - softnessRatio * 0.9;
+    const lineWidth = 1.5 + softnessRatio * 1.8;
+    const glow = Math.round(12 * softnessRatio);
 
     // Grid lines (4 horizontal divisions)
-    ctx.strokeStyle = "#1f2937";
+    ctx.strokeStyle = "rgba(225, 231, 239, 0.28)";
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = topMargin + (plotH * i) / 4;
@@ -280,7 +309,7 @@ export default function SignalMonitor({
 
     // Y-axis labels (auto-ranged values)
     ctx.font = "9px monospace";
-    ctx.fillStyle = "#6b7280";
+    ctx.fillStyle = "rgba(197, 210, 226, 0.72)";
     ctx.textAlign = "right";
     for (let i = 0; i <= 4; i++) {
       const val = yMax - (yRange * i) / 4;
@@ -430,17 +459,27 @@ export default function SignalMonitor({
 
     // Signal trace
     ctx.beginPath();
-    ctx.strokeStyle = "#818cf8";
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = "rgba(196, 218, 242, 0.84)";
+    ctx.lineWidth = lineWidth;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.shadowColor = "rgba(128, 184, 230, 0.16)";
+    ctx.shadowBlur = glow;
+
+    let previous = buffer[0].raw;
     for (let i = 0; i < buffer.length; i++) {
+      const raw = buffer[i].raw;
+      const smoothed = previous + (raw - previous) * smoothAlpha;
+      previous = smoothed;
       const x =
         margin + ((buffer[i].time - bufferStartTime) / timeSpan) * plotW;
-      const normalized = (buffer[i].raw - yMin) / yRange;
+      const normalized = (smoothed - yMin) / yRange;
       const y = topMargin + plotH * (1 - normalized);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
     ctx.stroke();
+    ctx.shadowBlur = 0;
 
     // Current value line (horizontal dashed)
     const latest = latestRef.current;
@@ -448,7 +487,7 @@ export default function SignalMonitor({
       const latestNorm = (latest - yMin) / yRange;
       const latestY = topMargin + plotH * (1 - latestNorm);
       ctx.beginPath();
-      ctx.strokeStyle = "#22c55e";
+      ctx.strokeStyle = "rgba(170, 197, 225, 0.32)";
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 3]);
       ctx.moveTo(margin, latestY);
@@ -462,11 +501,11 @@ export default function SignalMonitor({
     ctx.textAlign = "right";
 
     // Current
-    ctx.fillStyle = "#22c55e";
+    ctx.fillStyle = "rgba(226, 238, 251, 0.88)";
     ctx.fillText(`NOW ${formatSignal(latest)}`, w - rightMargin - 2, topMargin + 12);
 
     // Visible range
-    ctx.fillStyle = "#818cf8";
+    ctx.fillStyle = "rgba(203, 221, 241, 0.78)";
     ctx.fillText(
       `RNG ${formatSignal(visMax - visMin)}`,
       w - rightMargin - 2,
@@ -477,7 +516,7 @@ export default function SignalMonitor({
     const atMin = allTimeMinRef.current;
     const atMax = allTimeMaxRef.current;
     if (atMin < Infinity) {
-      ctx.fillStyle = "#ef4444";
+      ctx.fillStyle = "rgba(188, 205, 225, 0.72)";
       ctx.fillText(
         `MIN ${formatSignal(atMin)}`,
         w - rightMargin - 2,
@@ -485,7 +524,7 @@ export default function SignalMonitor({
       );
     }
     if (atMax > -Infinity) {
-      ctx.fillStyle = "#f59e0b";
+      ctx.fillStyle = "rgba(188, 205, 225, 0.72)";
       ctx.fillText(
         `MAX ${formatSignal(atMax)}`,
         w - rightMargin - 2,
@@ -494,7 +533,7 @@ export default function SignalMonitor({
     }
 
     // Time labels along bottom (reflect visible window)
-    ctx.fillStyle = "#4b5563";
+    ctx.fillStyle = "rgba(175, 194, 215, 0.74)";
     ctx.textAlign = "center";
     const visSeconds = timeSpan / POINTS_PER_SECOND;
     const offsetSeconds = offset / POINTS_PER_SECOND;
@@ -507,20 +546,20 @@ export default function SignalMonitor({
 
     // Title
     ctx.font = "bold 10px monospace";
-    ctx.fillStyle = "#9ca3af";
+    ctx.fillStyle = "rgba(221, 235, 249, 0.82)";
     ctx.textAlign = "left";
     ctx.fillText("RAW SIGNAL", margin + 4, topMargin + 12);
 
     // Paused indicator
     if (pausedRef.current) {
       ctx.font = "bold 10px monospace";
-      ctx.fillStyle = "#f59e0b";
+      ctx.fillStyle = "rgba(250, 206, 84, 0.95)";
       ctx.textAlign = "center";
       ctx.fillText("PAUSED", w / 2, topMargin + 12);
     }
 
     animRef.current = requestAnimationFrame(draw);
-  }, []);
+  }, [softness]);
 
   // Animation loop
   useEffect(() => {
@@ -626,141 +665,293 @@ export default function SignalMonitor({
     }
   }, []);
 
+  const annotationButtonLabel = showAnnotations ? "Annotations On" : "Annotations Off";
+  const pauseButtonLabel = paused ? "Play" : "Pause";
+
+  const toolbarButtonClass = "ms-signal-btn h-11 w-11 px-0";
+
   return (
-    <div
-      className={`w-full bg-gray-950 rounded-lg border border-gray-800 relative ${
-        expanded ? "h-[250px]" : "h-48"
+      <div
+        className={`w-full ms-panel relative overflow-hidden ${
+        expanded ? "h-[560px]" : "h-[28rem]"
       }`}
     >
-      <canvas
-        ref={canvasRef}
-        className="w-full h-full"
-        style={{ cursor: paused ? (dragRef.current ? "grabbing" : "grab") : "default" }}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
-      />
+      <div className="relative flex h-full flex-col">
+        <div className="relative flex-1 min-h-0">
+          <canvas
+            ref={canvasRef}
+            className="w-full h-full"
+            style={{ cursor: paused ? (dragRef.current ? "grabbing" : "grab") : "default" }}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseUp}
+            onWheel={handleWheel}
+          />
+        </div>
 
-      {/* Annotations toggle */}
-      <button
-        onClick={onToggleAnnotations}
-        className={`absolute top-1.5 left-1.5 text-[9px] font-bold px-2 py-0.5 rounded transition-colors ${
-          showAnnotations
-            ? "bg-emerald-600 text-white"
-            : "bg-gray-800 text-gray-500 hover:text-gray-300"
-        }`}
-      >
-        {showAnnotations ? "ANNOTATIONS ON" : "ANNOTATIONS OFF"}
-      </button>
+        <div className="ms-signal-toolbar">
+          <div className="ms-signal-toolbar-group">
+            <button
+              onClick={onToggleAnnotations}
+              className={`${toolbarButtonClass} ${
+                showAnnotations ? "bg-emerald-600 text-white border-emerald-300/50" : ""
+              }`}
+              title={annotationButtonLabel}
+              aria-label={annotationButtonLabel}
+            >
+              {showAnnotations ? (
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <path d="m21 15-5 5-5-5" />
+                  <path d="m21 9-5-5-5 5" />
+                  <path d="M9 9H4V7a2 2 0 0 1 2-2h3" />
+                  <path d="M9 15h5v2a2 2 0 0 1-2 2H4" />
+                </svg>
+              ) : (
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <path d="m21 15-5 5-5-5" />
+                  <path d="m21 9-5-5-5 5" />
+                  <line x1="7" y1="12" x2="4" y2="12" />
+                  <line x1="10" y1="12" x2="21" y2="12" />
+                </svg>
+              )}
+            </button>
 
-      {/* Recording marker buttons */}
-      <div className="absolute bottom-1.5 left-1.5 flex gap-1">
-        {!canMarkEnd && (
+            {!canMarkEnd && (
+              <button
+                onClick={() => {
+                  markersRef.current.push({ type: "start", time: counterRef.current });
+                  setCanMarkEnd(true);
+                }}
+                className={`${toolbarButtonClass} bg-emerald-700 text-white border-emerald-300/50`}
+                title="Mark Start"
+                aria-label="Mark Start"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <circle cx="12" cy="12" r="9" />
+                  <polygon points="10 8 16 12 10 16 10 8" />
+                </svg>
+              </button>
+            )}
+            {canMarkEnd && (
+              <button
+                onClick={() => {
+                  markersRef.current.push({ type: "end", time: counterRef.current });
+                  setCanMarkEnd(false);
+                }}
+                className={`${toolbarButtonClass} bg-red-700 text-white border-red-300/50`}
+                title="Mark End"
+                aria-label="Mark End"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <circle cx="12" cy="12" r="9" />
+                  <line x1="9" y1="9" x2="15" y2="15" />
+                  <line x1="15" y1="9" x2="9" y2="15" />
+                </svg>
+              </button>
+            )}
+
+            <button
+              onClick={() => setShowSettings((open) => !open)}
+              className={`${toolbarButtonClass} ${showSettings ? "bg-cyan-700 text-white border-cyan-300/50" : ""}`}
+              title="Settings"
+              aria-label="Settings"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.9"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="w-5 h-5"
+              >
+                <circle cx="12" cy="12" r="3.2" />
+                <path d="M12 2.8v2.3M12 18.9v2.3M4.8 12h2.3M16.9 12h2.3M6 6l1.6 1.6M16.4 16.4l1.6 1.6M18 6l-1.6 1.6M7.6 16.4L6 18" />
+              </svg>
+            </button>
+
+            <button
+              onClick={handleExport}
+              className={toolbarButtonClass}
+              title="Export signal data as JSON"
+              aria-label="Export signal data"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="w-5 h-5"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+            </button>
+
+            <button
+              onClick={handleTogglePause}
+              className={`${toolbarButtonClass} ${paused ? "bg-amber-600 text-white border-amber-200/50" : ""}`}
+              title={pauseButtonLabel}
+              aria-label={pauseButtonLabel}
+            >
+              {paused ? (
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+              ) : (
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <rect x="6" y="4" width="4" height="16" />
+                  <rect x="14" y="4" width="4" height="16" />
+                </svg>
+              )}
+            </button>
+
+            <button
+              onClick={onToggleExpand}
+              className={toolbarButtonClass}
+              title={expanded ? "Collapse" : "Expand"}
+              aria-label={expanded ? "Collapse" : "Expand"}
+            >
+              {expanded ? (
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <polyline points="4 14 10 14 10 20" />
+                  <polyline points="20 10 14 10 14 4" />
+                  <line x1="14" y1="10" x2="21" y2="3" />
+                  <line x1="3" y1="21" x2="10" y2="14" />
+                </svg>
+              ) : (
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="w-5 h-5"
+                >
+                  <polyline points="15 3 21 3 21 9" />
+                  <polyline points="9 21 3 21 3 15" />
+                  <line x1="21" y1="3" x2="14" y2="10" />
+                  <line x1="3" y1="21" x2="10" y2="14" />
+                </svg>
+              )}
+            </button>
+          </div>
+
           <button
-            onClick={() => {
-              markersRef.current.push({ type: "start", time: counterRef.current });
-              setCanMarkEnd(true);
-            }}
-            className="text-[9px] font-bold px-2 py-0.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white transition-colors"
+            onClick={handleClear}
+            className={`${toolbarButtonClass} bg-red-700/80 text-white border-red-300/40`}
+            title="Clear all signal data"
+            aria-label="Clear all signal data"
           >
-            MARK START
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.9"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+                className="w-5 h-5"
+            >
+              <path d="M4.5 7h15" />
+              <path d="M9.2 7V5.4a1.4 1.4 0 0 1 1.4-1.4h2.8a1.4 1.4 0 0 1 1.4 1.4V7" />
+              <rect x="6.3" y="7" width="11.4" height="13" rx="2.1" />
+              <path d="M10.2 10.7v6.2M13.8 10.7v6.2" />
+            </svg>
           </button>
-        )}
-        {canMarkEnd && (
-          <button
-            onClick={() => {
-              markersRef.current.push({ type: "end", time: counterRef.current });
-              setCanMarkEnd(false);
-            }}
-            className="text-[9px] font-bold px-2 py-0.5 rounded bg-red-700 hover:bg-red-600 text-white transition-colors"
-          >
-            MARK END
-          </button>
-        )}
+        </div>
       </div>
 
-      {/* Clear button */}
-      <button
-        onClick={handleClear}
-        className="absolute bottom-1.5 right-1.5 text-[9px] font-bold px-2 py-0.5 rounded bg-gray-800 text-gray-500 hover:text-red-400 transition-colors"
-        title="Clear all signal data"
-      >
-        CLEAR
-      </button>
-
-      {/* Export button */}
-      <button
-        onClick={handleExport}
-        className="absolute top-1.5 right-[5.5rem] text-[9px] font-bold px-2 py-0.5 rounded bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors"
-        title="Export signal data as JSON"
-      >
-        EXPORT
-      </button>
-
-      {/* Pause toggle */}
-      <button
-        onClick={handleTogglePause}
-        className={`absolute top-1.5 right-12 text-[9px] font-bold px-2 py-0.5 rounded transition-colors ${
-          paused
-            ? "bg-amber-600 text-white"
-            : "bg-gray-800 text-gray-500 hover:text-gray-300"
-        }`}
-      >
-        {paused ? "▶ PLAY" : "⏸ PAUSE"}
-      </button>
-
-      {/* Expand/collapse toggle */}
-      <button
-        onClick={onToggleExpand}
-        className="absolute top-1.5 right-1.5 p-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
-        title={expanded ? "Collapse" : "Expand"}
-      >
-        {expanded ? (
-          /* Collapse (inward arrows) */
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="w-3.5 h-3.5"
-          >
-            <polyline points="4 14 10 14 10 20" />
-            <polyline points="20 10 14 10 14 4" />
-            <line x1="14" y1="10" x2="21" y2="3" />
-            <line x1="3" y1="21" x2="10" y2="14" />
-          </svg>
-        ) : (
-          /* Expand (outward arrows) */
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="w-3.5 h-3.5"
-          >
-            <polyline points="15 3 21 3 21 9" />
-            <polyline points="9 21 3 21 3 15" />
-            <line x1="21" y1="3" x2="14" y2="10" />
-            <line x1="3" y1="21" x2="10" y2="14" />
-          </svg>
-        )}
-      </button>
+      {showSettings && (
+        <div className="absolute top-2 right-2 z-10 w-56 ms-modal-shell text-gray-200 p-3">
+          <p className="text-[10px] font-semibold tracking-wide text-gray-400 mb-2">
+            Raw Signal Settings
+          </p>
+          <label className="block">
+            <span className="text-[10px] text-gray-400">Softness</span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={softness}
+              onChange={(e) => setSoftness(Number(e.target.value))}
+              className="mt-1 block w-full ms-slider"
+            />
+          </label>
+          <p className="text-[9px] text-gray-500 mt-1 text-right">{softness}%</p>
+        </div>
+      )}
     </div>
   );
-}
-
-/** Format a raw ADC signal value for display. */
-function formatSignal(val: number): string {
-  if (!isFinite(val)) return "---";
-  if (Math.abs(val) >= 1_000_000) return (val / 1_000_000).toFixed(3) + "M";
-  if (Math.abs(val) >= 1_000) return (val / 1_000).toFixed(1) + "k";
-  return val.toFixed(1);
 }

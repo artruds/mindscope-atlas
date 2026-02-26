@@ -5,7 +5,7 @@ type MessageHandler = (msg: WSMessage) => void;
 
 interface UseWebSocketReturn {
   connected: boolean;
-  send: (type: string, data?: Record<string, unknown>) => void;
+  send: (type: string, data?: Record<string, unknown>) => string | undefined;
   subscribe: (type: string, handler: MessageHandler) => () => void;
   lastMessage: WSMessage | null;
 }
@@ -90,6 +90,7 @@ export function useWebSocket(url: string): UseWebSocketReturn {
       const requestId = `req_${++requestIdCounter.current}`;
       const msg: WSMessage = { type, data, requestId };
       wsRef.current.send(JSON.stringify(msg));
+      return requestId;
     },
     []
   );

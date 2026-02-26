@@ -43,6 +43,45 @@ The meter measures galvanic skin response (resistance changes). You will receive
 
 Respond with your next auditor statement or question. Nothing else — no metadata, no explanations, just your in-session response."""
 
+CONVERSATIONAL_SYSTEM_PROMPT = """\
+You are an AI auditor having a free-form, exploratory conversation with a person (referred to as "PC"). Unlike a structured protocol, this is an open dialogue where you follow the person's attention and the meter's charge readings.
+
+## Your Role
+
+- You are warm, curious, non-judgmental, and genuinely interested in what the person is saying
+- You explore topics that show charge (emotional reactivity) on the meter
+- You NEVER interpret, evaluate, or give advice — you help the person look at things for themselves
+- You ask open-ended questions that help the person explore their own thoughts and feelings
+
+## Charge Interpretation
+
+You will receive charge analysis data with each turn:
+- **Charge Score 70-100 (HIGH)**: Strong reaction. Stay on this topic — explore it deeper. Ask follow-up questions.
+- **Charge Score 40-69 (MODERATE)**: Some reaction. Worth exploring further with a related question.
+- **Charge Score 10-39 (LOW)**: Minimal reaction. Consider shifting to a related but different angle.
+- **Charge Score 0-9 (NONE)**: No charge. Move on to something new.
+- **Body Movement**: Ignore this reading entirely — it's a physical artifact (grip change), not emotional charge.
+
+## E-Meter Basics
+
+- **Fall / Long Fall / Blowdown**: Charge releasing. Good — explore further.
+- **Floating Needle (F/N)**: Release point. Acknowledge and move on.
+- **Rise**: Protest or disagreement. Back off or adjust.
+- **Rock Slam**: Extreme charge. Handle with care.
+- **Stuck**: Not in communication. Rephrase or reconnect.
+
+## Response Rules
+
+1. **Keep responses to 1-3 sentences maximum.** Ask questions, not speeches.
+2. **Ask ONE question per turn.** Never stack multiple questions.
+3. **Acknowledge before asking.** Briefly acknowledge what the person said.
+4. **Follow the charge.** When charge is high, dig deeper on that topic.
+5. **Respect the F/N.** When floating needle appears, acknowledge and move on.
+6. **Be natural.** This is a conversation, not an interrogation.
+7. **Never invalidate.** Accept whatever the person says.
+
+Respond with your next statement or question. Nothing else — no metadata, no explanations."""
+
 MAX_HISTORY = 80
 MODEL = "claude-sonnet-4-20250514"
 
@@ -129,6 +168,87 @@ class AIAuditor:
             model=MODEL,
             max_tokens=256,
             system=SYSTEM_PROMPT,
+            messages=self._history,
+        )
+
+        text = response.content[0].text
+        self._history.append({"role": "assistant", "content": text})
+
+        return text
+
+    def _build_conversational_message(
+        self,
+        pc_text: str,
+        meter_data: dict | None,
+        session_info: dict | None,
+        charge_data: dict | None,
+    ) -> str:
+        """Format the structured payload for conversational mode."""
+        parts = []
+
+        # Meter data
+        if meter_data:
+            ta = meter_data.get("toneArm", 2.0)
+            action = meter_data.get("needleAction", "idle")
+            sensitivity = meter_data.get("sensitivity", 16)
+            parts.append(
+                f"[METER]\nTA: {ta:.2f}\nNeedle Action: {action}\nSensitivity: {sensitivity}"
+            )
+
+        # Charge analysis
+        if charge_data:
+            score = charge_data.get("chargeScore", 0)
+            delta = charge_data.get("signalDelta", 0.0)
+            body = charge_data.get("bodyMovement", False)
+            history = charge_data.get("questionHistory", [])
+            parts.append(
+                f"[CHARGE ANALYSIS]\nCharge Score: {score}/100\n"
+                f"Signal Delta: {delta:.4f}\n"
+                f"Body Movement: {'YES — ignore this reading' if body else 'No'}"
+            )
+            if history:
+                recent = history[-3:]
+                lines = [f"  - \"{h['question']}\" → {h['chargeScore']}/100"
+                         + (" (body movement)" if h.get("bodyMovement") else "")
+                         for h in recent]
+                parts.append("[RECENT QUESTION CHARGE]\n" + "\n".join(lines))
+
+        # Session info
+        if session_info:
+            elapsed = session_info.get("elapsed", 0)
+            minutes = int(elapsed) // 60
+            seconds = int(elapsed) % 60
+            turn = session_info.get("turnNumber", 0)
+            parts.append(
+                f"[SESSION]\nDuration: {minutes}m {seconds}s\nExchanges: {turn}"
+            )
+
+        # PC statement
+        parts.append(f"[PERSON'S RESPONSE]\n{pc_text}")
+
+        return "\n\n".join(parts)
+
+    async def respond_conversational(
+        self,
+        pc_text: str,
+        meter_data: dict | None = None,
+        session_info: dict | None = None,
+        charge_data: dict | None = None,
+    ) -> str:
+        """Generate a conversational AI response (non-R3R mode)."""
+        user_msg = self._build_conversational_message(
+            pc_text, meter_data, session_info, charge_data
+        )
+        self._history.append({"role": "user", "content": user_msg})
+
+        # Trim history if too long
+        if len(self._history) > MAX_HISTORY:
+            self._history = self._history[-MAX_HISTORY:]
+
+        response = await self._client.messages.create(
+            model=MODEL,
+            max_tokens=256,
+            system=CONVERSATIONAL_SYSTEM_PROMPT,
             messages=self._history,
         )
 

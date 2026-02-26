@@ -163,20 +163,34 @@ class MessageRouter:
             return Message.error(f"PC not found: {pc_id}", msg.request_id)
 
         if self.server and self.server.active_session:
-            return Message.error("A session is already active", msg.request_id)
+            # Auto-end the stale session so the user can start fresh
+            old_sm = self.server.active_session
+            log.warning(
+                "Ending stale session %s before starting new one for PC %s",
+                old_sm.session_id, pc_id,
+            )
+            try:
+                await old_sm.end()
+            except Exception:
+                log.exception("Error ending stale session %s", old_sm.session_id)
+            self.server.active_session = None
+            if self.server.broadcaster:
+                self.server.broadcaster.session_id = None
 
         # Create session record
         session = SessionRecord(pc_id=pc_id)
         session = await self.db.create_session(session)
 
         # Create and start session manager
-        from ..orchestrator.session_manager import SessionManager
+        from ..orchestrator.session_manager import SessionManager, SessionMode
+        session_mode = msg.data.get("sessionMode", SessionMode.STRUCTURED)
         sm = SessionManager(
             pc_id=pc_id,
             session_id=session.id,
             db=self.db,
             broadcast_fn=self._broadcast,
             ai_auditor=self.ai_auditor,
+            session_mode=session_mode,
         )
         await sm.start()
 
@@ -186,6 +200,8 @@ class MessageRouter:
             if self.server.broadcaster:
                 self.server.broadcaster.session_id = session.id
                 self.server.broadcaster.ta_tracker.reset_session()
+                # Wire charge tracker from broadcaster to session manager
+                sm.charge_tracker = self.server.broadcaster.charge_tracker
 
         return Message(
             type=MessageType.SESSION_STARTED.value,

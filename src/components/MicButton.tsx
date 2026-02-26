@@ -85,8 +85,8 @@ export default function MicButton({ send, disabled, mode }: MicButtonProps) {
     <button
       onClick={toggle}
       disabled={disabled}
-      className={`flex items-center justify-center w-9 h-9 rounded-full transition-colors ${
-        recording ? `${activeColor} animate-pulse` : idleColor
+      className={`flex items-center justify-center w-10 h-10 rounded-xl border border-gray-600 transition-colors ${
+        recording ? `${activeColor} animate-pulse border-cyan-200/40` : idleColor
       } disabled:opacity-40 disabled:cursor-not-allowed`}
       title={title}
     >

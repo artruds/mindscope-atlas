@@ -4,6 +4,8 @@ import asyncio
 import logging
 import signal
 import sys
+import os
+from pathlib import Path
 
 import websockets
 from websockets.asyncio.server import Server, ServerConnection
@@ -19,6 +21,31 @@ VERSION = "2.0.0-alpha.2"
 DEFAULT_PORT = 8765
 
 log = logging.getLogger("mindscope")
+
+
+def _load_env_file() -> None:
+    """Load key=value pairs from .env files into process environment."""
+    repo_root = Path(__file__).resolve().parent.parent
+    env_paths = [repo_root / ".env", repo_root / "backend" / ".env"]
+
+    for env_path in env_paths:
+        if not env_path.exists():
+            continue
+        try:
+            with env_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    text = line.strip()
+                    if not text or text.startswith("#"):
+                        continue
+                    if "=" not in text:
+                        continue
+                    key, value = text.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+        except OSError:
+            log.exception("Unable to read env file: %s", env_path)
+
+
+_load_env_file()
 
 
 class MindScopeServer:

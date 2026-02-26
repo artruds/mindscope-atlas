@@ -51,6 +51,8 @@ export enum MessageType {
   // Session recovery
   SESSION_RECOVER = "session.recover",
   SESSION_RECOVERED = "session.recovered",
+  // Charge
+  CHARGE_MAP = "charge.map",
   // Database
   DB_STATUS = "db.status",
   DB_STATUS_DATA = "db.status.data",
@@ -171,6 +173,8 @@ export type R3RState =
   | "CHECK_NEXT_FLOW"
   | "ITEM_COMPLETE";
 
+export type SessionMode = "structured" | "conversational";
+
 export interface SessionState {
   phase: string;
   step: string;
@@ -181,6 +185,7 @@ export interface SessionState {
   sessionId: string;
   currentCommand: string;
   turnNumber: number;
+  sessionMode?: SessionMode;
 }
 
 export interface TranscriptEntry {
@@ -202,4 +207,15 @@ export interface ChatMessage {
   sensitivity?: number;
   isAiGenerated?: boolean;
   questionDroppedAt?: number; // epoch seconds (auditor questions only)
+  chargeScore?: number; // 0-100 charge score (conversational mode)
+  bodyMovement?: boolean; // whether this was a body movement artifact
+}
+
+export interface ChargeMapEntry {
+  question: string;
+  chargeScore: number;
+  signalDelta: number;
+  peakDeviation: number;
+  bodyMovement: boolean;
+  timestamp: number;
 }
