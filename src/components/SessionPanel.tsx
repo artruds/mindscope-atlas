@@ -5,6 +5,8 @@ import type {
   PCProfile,
   SessionState,
   ChatMessage,
+  ChargeMapEntry,
+  SessionMode,
 } from "../types/messages";
 import MicButton from "./MicButton";
 import ChatBubble from "./ChatBubble";
@@ -17,6 +19,8 @@ interface SessionPanelProps {
   profiles: PCProfile[];
   selectedPcId: string;
   onSelectPc: (id: string) => void;
+  sessionMode: SessionMode;
+  onSessionModeChange: (mode: SessionMode) => void;
   sensitivity: number;
   toneArm: number;
 }
@@ -36,6 +40,8 @@ export default function SessionPanel({
   profiles,
   selectedPcId,
   onSelectPc,
+  sessionMode,
+  onSessionModeChange,
   sensitivity,
   toneArm,
 }: SessionPanelProps) {
@@ -46,6 +52,7 @@ export default function SessionPanel({
   const [autoRecord, setAutoRecord] = useState(false);
   const [isAutoRecording, setIsAutoRecording] = useState(false);
   const [autoSend, setAutoSend] = useState(false);
+  const [chargeMap, setChargeMap] = useState<ChargeMapEntry[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const autoSendTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const autoRecorderRef = useRef<MediaRecorder | null>(null);
@@ -128,6 +135,9 @@ export default function SessionPanel({
       }),
       subscribe(MessageType.SESSION_STARTED, (msg) => {
         const state = msg.data as unknown as SessionState;
+        if (state.sessionMode) {
+          onSessionModeChange(state.sessionMode);
+        }
         setSessionState(state);
         // Save to localStorage for recovery
         localStorage.setItem("mindscope_lastSessionId", state.sessionId);
@@ -137,6 +147,7 @@ export default function SessionPanel({
       subscribe(MessageType.SESSION_ENDED, () => {
         setSessionState(null);
         setIsAiTyping(false);
+        setChargeMap([]);
         localStorage.removeItem("mindscope_lastSessionId");
         localStorage.removeItem("mindscope_lastPcId");
       }),
@@ -179,6 +190,10 @@ export default function SessionPanel({
           if (text) setPcInput(text);
         }
       }),
+      subscribe(MessageType.CHARGE_MAP, (msg) => {
+        const entries = (msg.data.entries as unknown as ChargeMapEntry[]) ?? [];
+        setChargeMap(entries);
+      }),
       subscribe(MessageType.SESSION_RECOVERED, (msg) => {
         const recovered = (msg.data.messages as unknown as ChatMessage[]) ?? [];
         if (recovered.length > 0) {
@@ -192,7 +207,7 @@ export default function SessionPanel({
       }),
     ];
     return () => unsubs.forEach((u) => u());
-  }, [subscribe, startAutoRecording]);
+  }, [subscribe, startAutoRecording, onSessionModeChange]);
 
   // Attempt session recovery on mount
   useEffect(() => {
@@ -212,9 +227,13 @@ export default function SessionPanel({
   const handleStart = useCallback(() => {
     if (!selectedPcId) return;
     setMessages([]);       // clear BEFORE sending
+    setChargeMap([]);
     setIsAiTyping(false);
-    send(MessageType.SESSION_START, { pcId: selectedPcId });
-  }, [selectedPcId, send]);
+    send(MessageType.SESSION_START, {
+      pcId: selectedPcId,
+      sessionMode,
+    });
+  }, [selectedPcId, send, sessionMode]);
 
   const handleEnd = useCallback(() => {
     send(MessageType.SESSION_END);
@@ -269,18 +288,38 @@ export default function SessionPanel({
   }, [stopAutoRecording]);
 
   const isActive = sessionState !== null && sessionState.phase !== "COMPLETE";
+  const effectiveSessionMode = sessionState?.sessionMode ?? sessionMode;
   const selectedPc = profiles.find((pc) => pc.id === selectedPcId) ?? null;
 
   return (
     <div className="flex flex-col h-full gap-3">
       {/* Controls */}
-      <div className="ms-panel p-4">
-        <div className="flex items-center gap-3 mb-3">
+      <div className="ms-panel p-4 overflow-hidden">
+        <div className="ms-session-toolbar mb-3">
+          <div className="ms-segmented shrink-0">
+            <button
+              type="button"
+              onClick={() => onSessionModeChange("structured")}
+              disabled={isActive}
+              className={`ms-mini-btn ms-segment-btn ${effectiveSessionMode === "structured" ? "bg-cyan-500 text-black" : "text-cyan-200"}`}
+            >
+              Structured
+            </button>
+            <button
+              type="button"
+              onClick={() => onSessionModeChange("conversational")}
+              disabled={isActive}
+              className={`ms-mini-btn ms-segment-btn ${effectiveSessionMode === "conversational" ? "bg-cyan-500 text-black" : "text-cyan-200"}`}
+            >
+              Conversational
+            </button>
+          </div>
+
           <select
             value={selectedPcId}
             onChange={(e) => onSelectPc(e.target.value)}
             disabled={isActive}
-            className="ms-select flex-1 min-w-0"
+            className="ms-select ms-toolbar-select flex-1 min-w-0"
           >
             <option value="">Select PC...</option>
             {profiles.map((pc) => (
@@ -294,7 +333,7 @@ export default function SessionPanel({
             <button
               onClick={handleStart}
               disabled={!connected || !selectedPcId}
-              className="ms-btn ms-btn-emerald ms-pill min-w-36"
+              className="ms-btn ms-btn-emerald ms-pill ms-toolbar-cta"
             >
               Start Session
             </button>
@@ -406,6 +445,25 @@ export default function SessionPanel({
             <div className="flex justify-start">
               <div className="bg-gray-800 px-3 py-2 rounded-lg text-sm text-gray-400 animate-pulse">
                 Auditor is thinking...
+              </div>
+            </div>
+          )}
+
+          {chargeMap.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-[11px] uppercase tracking-[0.2em] text-gray-400">Charge Map</div>
+              <div className="max-h-28 overflow-y-auto space-y-1 pr-1">
+                {chargeMap.map((entry, i) => (
+                  <div
+                    key={`${entry.timestamp}-${i}`}
+                    className="rounded-md border border-gray-800 bg-black/20 px-2 py-1"
+                  >
+                    <p className="text-xs text-cyan-200">{entry.question}</p>
+                    <p className="text-[10px] text-gray-400 mt-1">
+                      Charge {entry.chargeScore} • Peak {entry.peakDeviation.toFixed(2)}
+                    </p>
+                  </div>
+                ))}
               </div>
             </div>
           )}

@@ -3,9 +3,7 @@ import type { WSMessage } from "../types/messages";
 import {
   ARC_MAX,
   ARC_MIN,
-  RAW_SCALE,
   SET_ANGLE,
-  TA_SCALE,
   useMeterSignal,
 } from "../hooks/useMeterSignal";
 import { degToRad } from "../utils";
@@ -42,13 +40,8 @@ export default function MeterDisplay({
     rawSignalDisplay,
     needleAction,
     taMotion,
-    handleSet: resetBaseline,
-  } = useMeterSignal(subscribe, sensitivity, toneArm, smoothing);
-
-  const handleSet = useCallback(() => {
-    resetBaseline();
-    onToneArmChange(2.0);
-  }, [onToneArmChange, resetBaseline]);
+    handleSet,
+  } = useMeterSignal(subscribe, sensitivity, toneArm, smoothing, onToneArmChange);
 
   const adjustSensitivity = useCallback((delta: number) => {
     const idx = SENSITIVITY_STEPS.findIndex((value) => value >= sensitivity);

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { MessageType, type DBStatus, type PCProfile, type WSMessage } from "./types/messages";
 import { AppLayout } from "./AppLayout";
+import type { SessionMode } from "./types/messages";
 
 // In Electron, the preload script exposes the port; in dev browser, default to 8765
 const port = (window as unknown as { __MINDSCOPE_PORT__?: number }).__MINDSCOPE_PORT__ ?? 8765;
@@ -16,6 +17,7 @@ export default function App() {
   const [sensitivity, setSensitivity] = useState(16);
   const [toneArm, setToneArm] = useState(2.0);
   const [smoothing, setSmoothing] = useState(50);
+  const [sessionMode, setSessionMode] = useState<SessionMode>("structured");
   const [showAnnotations, setShowAnnotations] = useState(false);
   const [signalExpanded, setSignalExpanded] = useState(false);
 
@@ -64,10 +66,12 @@ export default function App() {
       onSelectPc={setSelectedPcId}
       sensitivity={sensitivity}
       toneArm={toneArm}
+      sessionMode={sessionMode}
       smoothing={smoothing}
       setSensitivity={setSensitivity}
       setToneArm={setToneArm}
       setSmoothing={setSmoothing}
+      onSessionModeChange={setSessionMode}
       showManager={showManager}
       setShowManager={setShowManager}
       showAnnotations={showAnnotations}

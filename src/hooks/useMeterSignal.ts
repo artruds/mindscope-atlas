@@ -5,22 +5,28 @@ import type { MeterEventData, TAMotionData, WSMessage } from "../types/messages"
 export const SET_ANGLE = -12;
 export const ARC_MIN = -65;
 export const ARC_MAX = 65;
-export const TA_SCALE = 10;
-export const RAW_SCALE = 0.002;
+export const TA_BRIDGE_FACTOR = 12500;
+export const RAW_SCALE = 0.00005;
 export const POSITION_SCALE = 130;
-
-const POSITION_CENTER = 0.5;
+const ABSOLUTE_RAW_MIN = 1000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function isValidNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
+function parseNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 }
 
-function hasValidPosition(value: unknown): value is number {
-  return isValidNumber(value) && value >= 0 && value <= 1;
+function isValidNumber(value: unknown): value is number {
+  return parseNumber(value) !== null;
 }
 
 export interface MeterSignalOutput {
@@ -40,6 +46,7 @@ export function useMeterSignal(
   sensitivity: number,
   toneArm: number,
   smoothing: number,
+  onToneArmChange: (value: number) => void,
 ): MeterSignalOutput {
   const dataRef = useRef<MeterEventData | null>(null);
   const rawBaselineRef = useRef<number | null>(null);
@@ -58,57 +65,68 @@ export function useMeterSignal(
       const d = msg.data as unknown as MeterEventData;
       dataRef.current = d;
       setHwConnected(d.hardwareConnected ?? false);
-      setSamples(d.samplesReceived ?? 0);
-      setRawSignalDisplay(d.rawSignal ?? 0);
+      setSamples(parseNumber(d.samplesReceived) ?? 0);
+      setRawSignalDisplay(parseNumber(d.rawSignal) ?? 0);
       setNeedleAction(d.needleAction ?? "idle");
       if (d.taMotion) {
         setTaMotion(d.taMotion);
       }
 
-      const hasPosition = hasValidPosition(d.position);
-
-      if (hasPosition && positionBaselineRef.current === null) {
-        positionBaselineRef.current = d.position;
+      const raw = parseNumber(d.rawSignal);
+      if (rawBaselineRef.current === null && raw !== null) {
+        rawBaselineRef.current = raw;
       }
 
-      const raw = d.rawSignal;
-      if (rawBaselineRef.current === null && isValidNumber(raw)) {
-        rawBaselineRef.current = raw;
+      const position = parseNumber(d.position);
+      if (positionBaselineRef.current === null && position !== null) {
+        positionBaselineRef.current = position;
       }
     });
   }, [subscribe]);
 
   const draw = useCallback(() => {
     const data = dataRef.current;
-    const position = isValidNumber(data?.position) ? data.position : null;
-    const rawSignal = isValidNumber(data?.rawSignal) ? data.rawSignal : null;
-    const hasPosition = position !== null && position >= 0 && position <= 1;
-    const positionDelta =
-      hasPosition && positionBaselineRef.current !== null
-        ? Math.abs(position - positionBaselineRef.current)
-        : Number.MAX_VALUE;
-    // If position is present but effectively flat, prefer raw signal for motion.
-    // This avoids a frozen needle when `position` is stale while raw signal is active.
-    const usePositionSignal = hasPosition && positionDelta > 0.00025;
-    const motionSourceValue = usePositionSignal ? position : rawSignal;
-    const smoothed = (isValidNumber(motionSourceValue) ? motionSourceValue : rawBaselineRef.current) ?? POSITION_CENTER;
-    const unfiltered = usePositionSignal
-      ? smoothed
-      : isValidNumber(data?.rawUnfiltered)
-      ? data.rawUnfiltered
-      : smoothed;
-    const baseline = usePositionSignal
-      ? positionBaselineRef.current ?? smoothed
-      : rawBaselineRef.current ?? smoothed;
-    const signalScale = usePositionSignal ? POSITION_SCALE : RAW_SCALE;
+    const rawSignal = parseNumber(data?.rawSignal);
+    const rawUnfiltered = parseNumber(data?.rawUnfiltered) ?? rawSignal;
+    const position = parseNumber(data?.position);
+
+    if (positionBaselineRef.current === null && position !== null) {
+      positionBaselineRef.current = position;
+    }
+
+    if (rawBaselineRef.current === null && rawSignal !== null) {
+      rawBaselineRef.current = rawSignal;
+    }
+
+    const useAbsoluteRaw =
+      rawSignal !== null &&
+      rawUnfiltered !== null &&
+      Math.abs(rawSignal) > ABSOLUTE_RAW_MIN &&
+      Math.abs(rawUnfiltered) > ABSOLUTE_RAW_MIN;
+    const usingPosition = !useAbsoluteRaw;
+
+    const signalScale = usingPosition ? POSITION_SCALE : RAW_SCALE;
+
+    const baseline = useAbsoluteRaw
+      ? rawBaselineRef.current
+      : positionBaselineRef.current;
+
+    if (!isValidNumber(baseline) || (usingPosition && !isValidNumber(position))) {
+      setDisplayedAngle(displayedAngleRef.current);
+      animRef.current = requestAnimationFrame(draw);
+      return;
+    }
+
     const blend = smoothing / 100;
-    const raw = unfiltered + (smoothed - unfiltered) * blend;
-    const delta = baseline - raw;
-    const amplifiedDelta = delta * sensitivity * signalScale;
-    const taOffset = (toneArm - 2.0) * TA_SCALE;
-    const targetAngle = SET_ANGLE + amplifiedDelta + taOffset;
+    const signalValue = useAbsoluteRaw
+      ? rawUnfiltered + (rawSignal! - rawUnfiltered) * blend
+      : position ?? 0.5;
+    const signalDelta = baseline - signalValue;
+    const taOffset = (toneArm - 2.0) * TA_BRIDGE_FACTOR;
+    const bridgeOutput = signalDelta + taOffset;
+    const targetAngle = SET_ANGLE + bridgeOutput * sensitivity * signalScale;
     const clamped = clamp(targetAngle, ARC_MIN, ARC_MAX);
-    const damping = 0.08 + blend * 0.26;
+    const damping = 0.02 + blend * 0.23;
     displayedAngleRef.current += (clamped - displayedAngleRef.current) * damping;
 
     setDisplayedAngle(displayedAngleRef.current);
@@ -121,20 +139,19 @@ export function useMeterSignal(
   }, [draw]);
 
   const handleSet = useCallback(() => {
-    const raw = dataRef.current?.rawSignal ?? 0;
-    const position = dataRef.current?.position;
-    if (isValidNumber(raw)) {
+    const raw = parseNumber(dataRef.current?.rawSignal);
+    if (raw === null) {
+      return;
+    }
+    if (rawBaselineRef.current === null) {
       rawBaselineRef.current = raw;
+      return;
     }
-    if (hasValidPosition(position)) {
-      positionBaselineRef.current = position;
-      displayedAngleRef.current = SET_ANGLE;
-      setDisplayedAngle(SET_ANGLE);
-    } else if (isValidNumber(raw)) {
-      displayedAngleRef.current = SET_ANGLE;
-      setDisplayedAngle(SET_ANGLE);
-    }
-  }, []);
+
+    const signalDelta = raw - rawBaselineRef.current;
+    const newToneArm = clamp(2.0 + signalDelta / TA_BRIDGE_FACTOR, 0, 6);
+    onToneArmChange(newToneArm);
+  }, [onToneArmChange]);
 
   return {
     displayedAngle,

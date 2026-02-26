@@ -148,7 +148,7 @@ body {
   grid-template-columns: minmax(0, 1.55fr) minmax(0, 0.82fr);
   width: 100%;
   min-width: 0;
-  gap: 0.12rem;
+  gap: 0.48rem;
   flex: 1;
   min-height: 0;
 }
@@ -167,7 +167,7 @@ body {
 .ms-panel-stack {
   display: flex;
   flex-direction: column;
-  gap: 0.12rem;
+  gap: 0.48rem;
   min-height: 0;
   min-width: 0;
 }
@@ -176,7 +176,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.04rem 0.22rem;
+  padding: 0.14rem 0.34rem;
 }
 
 .ms-section-header h2 {
@@ -532,6 +532,57 @@ body {
 .ms-mini-btn:hover {
   color: #f4fffe;
   border-color: rgba(134, 243, 235, 0.46);
+}
+
+.ms-session-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.72rem;
+  flex-wrap: wrap;
+}
+
+.ms-session-toolbar > * {
+  min-width: 0;
+}
+
+.ms-segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: center;
+  gap: 0.36rem;
+  border-radius: 999px;
+  border: 1px solid rgba(120, 225, 211, 0.24);
+  background: rgba(8, 30, 41, 0.7);
+  padding: 0.28rem;
+  min-width: 17.25rem;
+}
+
+.ms-segment-btn {
+  border-radius: 999px;
+  min-height: 2.45rem;
+  padding: 0.46rem 1rem;
+  font-size: 0.66rem;
+  letter-spacing: 0.09em;
+}
+
+.ms-toolbar-select {
+  min-height: 2.45rem;
+  border-radius: 999px;
+}
+
+.ms-toolbar-cta {
+  min-height: 2.45rem;
+  min-width: 12.5rem;
+}
+
+@media (max-width: 1280px) {
+  .ms-segmented {
+    min-width: 100%;
+  }
+
+  .ms-toolbar-select {
+    flex: 1 1 16rem;
+  }
 }
 
 .ms-signal-toolbar {

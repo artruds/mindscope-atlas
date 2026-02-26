@@ -15,9 +15,11 @@ interface AppLayoutProps {
   sensitivity: number;
   toneArm: number;
   smoothing: number;
+  sessionMode: "structured" | "conversational";
   setSensitivity: (value: number) => void;
   setToneArm: (value: number) => void;
   setSmoothing: (value: number) => void;
+  onSessionModeChange: (mode: "structured" | "conversational") => void;
   showManager: boolean;
   setShowManager: (open: boolean) => void;
   showAnnotations: boolean;
@@ -37,9 +39,11 @@ export function AppLayout({
   sensitivity,
   toneArm,
   smoothing,
+  sessionMode,
   setSensitivity,
   setToneArm,
   setSmoothing,
+  onSessionModeChange,
   showManager,
   setShowManager,
   showAnnotations,
@@ -99,7 +103,7 @@ export function AppLayout({
       <div className="ms-main flex-1 min-h-0 p-0 sm:p-0.5 relative w-full min-w-0 overflow-hidden">
         <div className="ms-app-frame h-full">
           <div className="ms-grid h-full">
-            <section className="h-full ms-panel-stack ms-fade-up ms-delay-1 min-w-0 min-h-0 overflow-hidden">
+            <section className="h-full ms-panel-stack ms-fade-up ms-delay-1 min-w-0 min-h-0 overflow-hidden px-1">
               <div className="flex-1 min-h-0">
                 <MeterDisplay
                   subscribe={subscribe}
@@ -124,7 +128,7 @@ export function AppLayout({
               )}
             </section>
 
-            <section className="h-full ms-panel-stack ms-fade-up ms-delay-2 min-w-0 min-h-0 overflow-hidden">
+            <section className="h-full ms-panel-stack ms-fade-up ms-delay-2 min-w-0 min-h-0 overflow-hidden px-1">
               <div className="ms-section-header">
                 <h2>Session Control</h2>
                 <span className="ms-chip">
@@ -138,6 +142,8 @@ export function AppLayout({
                 profiles={profiles}
                 selectedPcId={selectedPcId}
                 onSelectPc={onSelectPc}
+                sessionMode={sessionMode}
+                onSessionModeChange={onSessionModeChange}
                 sensitivity={sensitivity}
                 toneArm={toneArm}
               />
