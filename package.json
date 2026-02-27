@@ -5,7 +5,9 @@
   "main": "electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"npm run dev:vite\" \"npm run dev:electron\"",
+    "dev:browser": "concurrently -k -n vite,backend -c cyan,yellow \"npm run dev:vite\" \"npm run dev:backend\"",
     "dev:vite": "vite",
+    "dev:backend": "./backend/.venv/bin/python3 -m backend",
     "dev:electron": "wait-on http-get://127.0.0.1:5173 && electron .",
     "build": "tsc && vite build",
     "preview": "vite preview"

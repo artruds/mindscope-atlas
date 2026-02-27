@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import time
 from datetime import datetime
 from typing import Callable, Awaitable, TYPE_CHECKING
@@ -49,6 +50,9 @@ END_RUDIMENTS = [
 ]
 
 
+CONVERSATIONAL_AI_TIMEOUT_SECONDS = 20
+
+
 class SessionManager:
     """Manages the full lifecycle of an auditing session."""
 
@@ -66,7 +70,10 @@ class SessionManager:
         self.db = db
         self.broadcast_fn = broadcast_fn
         self.ai_auditor = ai_auditor
-        self.session_mode = session_mode
+        normalized_mode = str(session_mode or "").strip().lower()
+        if normalized_mode not in (SessionMode.STRUCTURED, SessionMode.CONVERSATIONAL):
+            normalized_mode = SessionMode.STRUCTURED
+        self.session_mode = normalized_mode
 
         self.phase = SessionPhase.SETUP
         self.r3r = R3RStateMachine()
@@ -87,24 +94,45 @@ class SessionManager:
         self._rudiment_index = 0
 
     async def start(self) -> None:
-        """Begin the session — enter start rudiments."""
+        """Begin the session."""
         self._start_time = time.monotonic()
-        self.phase = SessionPhase.START_RUDIMENTS
-        self._rudiment_index = 0
-        self.current_command = START_RUDIMENTS[0]
 
         # Reset AI auditor history for new session
         if self.ai_auditor:
             self.ai_auditor.reset()
 
-        self._add_transcript("auditor", self.current_command)
-        await self._persist_entry(self.transcript[-1])
-        await self._broadcast_chat("auditor", self.current_command)
+        if self.session_mode == SessionMode.CONVERSATIONAL:
+            self.phase = SessionPhase.PROCESSING
+            self._rudiment_index = 0
+            self.current_command = await self._conversational_opening()
+            self._add_transcript("auditor", self.current_command)
+            await self._persist_entry(self.transcript[-1])
+            await self._broadcast_chat(
+                "auditor", self.current_command, is_ai_generated=bool(self.ai_auditor)
+            )
+            log.info("Session %s started in conversational mode for PC %s", self.session_id, self.pc_id)
+        else:
+            self.phase = SessionPhase.START_RUDIMENTS
+            self._rudiment_index = 0
+            self.current_command = START_RUDIMENTS[0]
+            self._add_transcript("auditor", self.current_command)
+            await self._persist_entry(self.transcript[-1])
+            await self._broadcast_chat("auditor", self.current_command)
+
         await self._broadcast_state()
         log.info("Session %s started for PC %s", self.session_id, self.pc_id)
 
     async def end(self) -> None:
         """End the session and persist data."""
+        if self.session_mode == SessionMode.CONVERSATIONAL:
+            closing = await self._conversational_closing()
+            self.current_command = closing
+            self._add_transcript("auditor", closing)
+            await self._persist_entry(self.transcript[-1])
+            await self._broadcast_chat(
+                "auditor", closing, is_ai_generated=bool(self.ai_auditor)
+            )
+
         self.phase = SessionPhase.COMPLETE
         elapsed = self._elapsed_seconds()
 
@@ -127,6 +155,44 @@ class SessionManager:
 
         await self._broadcast_state()
         log.info("Session %s ended (%.0fs)", self.session_id, elapsed)
+
+    async def _conversational_opening(self) -> str:
+        """Generate the initial conversational opening from the AI auditor."""
+        pc_name = "this person"
+        try:
+            pc = await self.db.get_pc(self.pc_id)
+            if pc:
+                first_name = (pc.first_name or "").strip()
+                if first_name:
+                    pc_name = first_name
+        except Exception:
+            log.exception("Failed to load PC profile for conversational opening")
+
+        opening_note = (
+            f"A new session has just started with {pc_name}. "
+            "Begin naturally by greeting them warmly and start an open conversation. "
+            "You are an experienced auditor having a free-form conversation. "
+            "Follow the charge on the meter as it comes."
+        )
+
+        return await self._generate_conversational_response(
+            opening_note,
+            default="Welcome. Take a moment and tell me what you would like to explore today.",
+            meter_data=None,
+            charge_data=None,
+        )
+
+    async def _conversational_closing(self) -> str:
+        """Generate the final conversational closing from the AI auditor."""
+        closing_note = (
+            "The auditor has ended the session. Provide a brief, warm closing acknowledgment."
+        )
+        return await self._generate_conversational_response(
+            closing_note,
+            default="Thank you for your work today. We can pause here for now.",
+            meter_data=None,
+            charge_data=None,
+        )
 
     def pause(self) -> None:
         """Pause the session timer."""
@@ -175,6 +241,13 @@ class SessionManager:
             charge_score=charge_score,
             body_movement=body_movement,
         )
+
+        # Conversational mode is always AI-driven processing only.
+        if (
+            self.session_mode == SessionMode.CONVERSATIONAL
+            and self.phase in (SessionPhase.START_RUDIMENTS, SessionPhase.END_RUDIMENTS)
+        ):
+            self.phase = SessionPhase.PROCESSING
 
         # Determine next command based on phase
         if self.phase == SessionPhase.START_RUDIMENTS:
@@ -261,27 +334,58 @@ class SessionManager:
         if self.charge_tracker:
             charge_data = self.charge_tracker.get_analysis()
 
-        if self.ai_auditor:
-            try:
-                meter_data = meter.to_dict() if meter else None
-                session_info = self.get_state()
-                ai_response = await self.ai_auditor.respond_conversational(
-                    pc_text=text,
-                    meter_data=meter_data,
-                    session_info=session_info,
-                    charge_data=charge_data,
-                )
-                self.current_command = ai_response
-                is_ai = True
-            except Exception:
-                log.exception("AI auditor conversational error, falling back to default")
-                self.current_command = "Thank you. Tell me more about that."
-        else:
-            self.current_command = "Thank you. Tell me more about that."
+        meter_data = meter.to_dict() if meter else None
+        session_info = self.get_state()
+        self.current_command = await self._generate_conversational_response(
+            text,
+            default="Thank you. Tell me more about that.",
+            meter_data=meter_data,
+            charge_data=charge_data,
+            session_info=session_info,
+        )
+        # Flag as AI-generated only if it didn't use the default fallback text.
+        is_ai = self.current_command != "Thank you. Tell me more about that."
 
         self._add_transcript("auditor", self.current_command)
         await self._persist_entry(self.transcript[-1])
         await self._broadcast_chat("auditor", self.current_command, is_ai_generated=is_ai)
+
+    async def _generate_conversational_response(
+        self,
+        pc_text: str,
+        *,
+        default: str,
+        meter_data: dict | None,
+        charge_data: dict | None,
+        session_info: dict | None = None,
+    ) -> str:
+        """Generate a conversational AI response with timeout/fallback."""
+        if not self.ai_auditor:
+            return default
+
+        try:
+            response = await asyncio.wait_for(
+                self.ai_auditor.respond_conversational(
+                    pc_text=pc_text,
+                    meter_data=meter_data,
+                    session_info=session_info,
+                    charge_data=charge_data,
+                ),
+                timeout=CONVERSATIONAL_AI_TIMEOUT_SECONDS,
+            )
+            if isinstance(response, str) and response.strip():
+                return response
+            return default
+        except asyncio.TimeoutError:
+            log.warning(
+                "Conversational AI request timed out for session %s (sessionId %s)",
+                self.session_mode,
+                self.session_id,
+            )
+            return default
+        except Exception:
+            log.exception("AI auditor conversational error")
+            return default
 
     async def _advance_end_rudiments(
         self, text: str, meter: MeterEvent | None
@@ -300,6 +404,9 @@ class SessionManager:
 
     def start_end_rudiments(self) -> None:
         """Transition from processing to end rudiments."""
+        if self.session_mode == SessionMode.CONVERSATIONAL:
+            self.phase = SessionPhase.PROCESSING
+            return
         self.phase = SessionPhase.END_RUDIMENTS
         self._rudiment_index = 0
         self.current_command = END_RUDIMENTS[0]
@@ -384,6 +491,7 @@ class SessionManager:
             "text": text,
             "timestamp": datetime.utcnow().isoformat(),
             "turnNumber": self.turn_number,
+            "sessionId": self.session_id,
             "needleAction": needle_action,
             "toneArm": tone_arm,
             "sensitivity": sensitivity,

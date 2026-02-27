@@ -146,6 +146,7 @@ body {
 .ms-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.55fr) minmax(0, 0.82fr);
+  grid-auto-rows: minmax(0, 1fr);
   width: 100%;
   min-width: 0;
   gap: 0.48rem;
@@ -563,6 +564,29 @@ body {
   padding: 0.46rem 1rem;
   font-size: 0.66rem;
   letter-spacing: 0.09em;
+  position: relative;
+}
+
+.ms-segment-btn[aria-pressed="false"] {
+  background: rgba(20, 62, 76, 0.72);
+  border-color: rgba(112, 208, 202, 0.22);
+  color: #9dc5c2;
+}
+
+.ms-segment-btn[aria-pressed="false"]:hover {
+  background: rgba(25, 79, 96, 0.82);
+  border-color: rgba(141, 239, 231, 0.38);
+  color: #d4efed;
+}
+
+.ms-segment-btn[aria-pressed="true"] {
+  background: linear-gradient(180deg, #89efe2 0%, #43d9cb 100%);
+  border-color: rgba(176, 251, 243, 0.95);
+  color: #06262b;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.44),
+    0 0 0 1px rgba(108, 233, 224, 0.34),
+    0 8px 22px rgba(5, 31, 38, 0.32);
 }
 
 .ms-toolbar-select {

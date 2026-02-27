@@ -1,4 +1,4 @@
-"""AI auditor — Claude-powered natural language auditing."""
+"""AI auditor — Anthropic-powered natural language auditing."""
 
 from __future__ import annotations
 
@@ -44,14 +44,19 @@ The meter measures galvanic skin response (resistance changes). You will receive
 Respond with your next auditor statement or question. Nothing else — no metadata, no explanations, just your in-session response."""
 
 CONVERSATIONAL_SYSTEM_PROMPT = """\
-You are an AI auditor having a free-form, exploratory conversation with a person (referred to as "PC"). Unlike a structured protocol, this is an open dialogue where you follow the person's attention and the meter's charge readings.
+You are an AI auditor responsible for the entire session flow, from opening to closing.
+Unlike a structured protocol, this is an open, relaxed conversation where you follow the person's attention and the meter's charge readings.
 
 ## Your Role
 
-- You are warm, curious, non-judgmental, and genuinely interested in what the person is saying
-- You explore topics that show charge (emotional reactivity) on the meter
+- You are a knowledgeable, experienced auditor.
+- You are warm, present, and genuinely curious.
+- Open naturally by greeting the PC and establishing rapport, then start by exploring what is happening for them.
+- You are responsible for the full session flow from opening to closing.
+- Follow the meter charge readings to guide the conversation toward areas of interest.
 - You NEVER interpret, evaluate, or give advice — you help the person look at things for themselves
 - You ask open-ended questions that help the person explore their own thoughts and feelings
+- When the session is ending, provide a brief, warm acknowledgment that closes the interaction cleanly.
 
 ## Charge Interpretation
 
@@ -87,22 +92,30 @@ MODEL = "claude-sonnet-4-20250514"
 
 
 class AIAuditor:
-    """Claude-powered auditor that generates natural language responses."""
+    """Anthropic-powered auditor that generates natural language responses."""
 
-    def __init__(self, client: AsyncAnthropic) -> None:
+    def __init__(
+        self,
+        client: AsyncAnthropic,
+    ) -> None:
         self._client = client
         self._history: list[dict] = []
 
     @staticmethod
-    def create() -> AIAuditor | None:
+    def create() -> "AIAuditor | None":
         """Factory: returns None if no ANTHROPIC_API_KEY."""
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            log.info("AI auditor disabled — no ANTHROPIC_API_KEY")
-            return None
-        client = AsyncAnthropic(api_key=api_key)
-        log.info("AI auditor enabled")
-        return AIAuditor(client)
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if anthropic_key:
+            client = AsyncAnthropic(api_key=anthropic_key)
+            log.info("AI auditor enabled (anthropic)")
+            return AIAuditor(client=client)
+
+        log.info("AI auditor disabled — no ANTHROPIC_API_KEY")
+        return None
+
+    @property
+    def model_name(self) -> str:
+        return f"anthropic/{MODEL}"
 
     def reset(self) -> None:
         """Clear conversation history for a new session."""
@@ -164,14 +177,7 @@ class AIAuditor:
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[-MAX_HISTORY:]
 
-        response = await self._client.messages.create(
-            model=MODEL,
-            max_tokens=256,
-            system=SYSTEM_PROMPT,
-            messages=self._history,
-        )
-
-        text = response.content[0].text
+        text = await self._complete(SYSTEM_PROMPT)
         self._history.append({"role": "assistant", "content": text})
 
         return text
@@ -245,14 +251,16 @@ class AIAuditor:
         if len(self._history) > MAX_HISTORY:
             self._history = self._history[-MAX_HISTORY:]
 
-        response = await self._client.messages.create(
-            model=MODEL,
-            max_tokens=256,
-            system=CONVERSATIONAL_SYSTEM_PROMPT,
-            messages=self._history,
-        )
-
-        text = response.content[0].text
+        text = await self._complete(CONVERSATIONAL_SYSTEM_PROMPT)
         self._history.append({"role": "assistant", "content": text})
 
         return text
+
+    async def _complete(self, system_prompt: str) -> str:
+        response = await self._client.messages.create(
+            model=MODEL,
+            max_tokens=256,
+            system=system_prompt,
+            messages=self._history,
+        )
+        return response.content[0].text

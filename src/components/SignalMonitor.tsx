@@ -1,6 +1,11 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { MessageType } from "../types/messages";
-import type { MeterEventData, ChatMessage, WSMessage } from "../types/messages";
+import type {
+  MeterEventData,
+  ChatMessage,
+  SessionState,
+  WSMessage,
+} from "../types/messages";
 import { clamp, formatSignal } from "../utils";
 
 interface SignalMonitorProps {
@@ -20,6 +25,13 @@ const Y_PADDING = 0.05; // 5% padding above/below auto-range
 interface DataPoint {
   raw: number;
   time: number;
+  timestampMs: number;
+  rawSignal: number;
+  rawUnfiltered: number;
+  toneArm?: number;
+  position?: number;
+  needleAction?: string;
+  confidence?: number;
 }
 
 interface Annotation {
@@ -38,6 +50,18 @@ interface QuestionMarker {
 interface RecordingMarker {
   type: "start" | "end";
   time: number; // counter-based time (same as DataPoint.time)
+}
+
+interface TimelineMessage {
+  speaker: "auditor" | "pc";
+  text: string;
+  timestamp: string;
+  turnNumber: number;
+  sessionId?: string | null;
+  questionDroppedAt?: number;
+  chargeScore?: number;
+  bodyMovement?: boolean;
+  isAiGenerated?: boolean;
 }
 
 const ANNOTATION_COLORS: Record<string, string> = {
@@ -78,6 +102,16 @@ const ANNOTATION_LABEL_COLORS: Record<string, string> = {
   body_motion: "#9ca3af",
 };
 
+function parseTimestampMs(value: string | undefined): number {
+  if (!value) return Date.now();
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Date.now() : parsed;
+}
+
+function formatTimestamp(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
 export default function SignalMonitor({
   subscribe,
   smoothing,
@@ -109,16 +143,67 @@ export default function SignalMonitor({
   const allTimeMinRef = useRef<number>(Infinity);
   const allTimeMaxRef = useRef<number>(-Infinity);
   const latestRef = useRef<number>(0);
+  const timelineMessagesRef = useRef<TimelineMessage[]>([]);
+  const activeSessionIdRef = useRef<string | null>(null);
   const smoothingRef = useRef(smoothing);
   smoothingRef.current = smoothing;
   const showAnnotationsRef = useRef(showAnnotations);
   showAnnotationsRef.current = showAnnotations;
 
+  const resetTimelineSessionData = useCallback(() => {
+    bufferRef.current = [];
+    annotationsRef.current = [];
+    questionMarkersRef.current = [];
+    markersRef.current = [];
+    timelineMessagesRef.current = [];
+    counterRef.current = 0;
+    allTimeMinRef.current = Infinity;
+    allTimeMaxRef.current = -Infinity;
+    latestRef.current = 0;
+    lastClassifiedAtRef.current = 0;
+    viewOffsetRef.current = 0;
+    viewWindowRef.current = 60 * POINTS_PER_SECOND;
+    setCanMarkEnd(false);
+  }, []);
+
   // Subscribe to chat messages for question markers
   useEffect(() => {
     return subscribe(MessageType.CHAT_MESSAGE, (msg: WSMessage) => {
-      if (pausedRef.current) return; // don't add markers while paused
       const data = msg.data as unknown as ChatMessage;
+      if (activeSessionIdRef.current) {
+        const incomingSessionId = data.sessionId ?? null;
+        if (incomingSessionId && incomingSessionId !== activeSessionIdRef.current) {
+          return;
+        }
+        if (!incomingSessionId) {
+          return;
+        }
+      }
+
+      if (!activeSessionIdRef.current) {
+        const incomingSessionId = data.sessionId ?? null;
+        if (incomingSessionId) {
+          activeSessionIdRef.current = incomingSessionId;
+        }
+      }
+
+      timelineMessagesRef.current.push({
+        speaker: data.speaker,
+        text: data.text,
+        timestamp: data.timestamp || new Date().toISOString(),
+        turnNumber: data.turnNumber ?? 0,
+        sessionId: data.sessionId ?? null,
+        questionDroppedAt: data.questionDroppedAt,
+        chargeScore: data.chargeScore,
+        bodyMovement: data.bodyMovement,
+        isAiGenerated: data.isAiGenerated,
+      });
+      const messageCap = MAX_POINTS;
+      if (timelineMessagesRef.current.length > messageCap) {
+        timelineMessagesRef.current = timelineMessagesRef.current.slice(-messageCap);
+      }
+
+      if (pausedRef.current) return; // don't add chart markers while paused
       if (data.speaker === "auditor" && data.questionDroppedAt) {
         questionMarkersRef.current.push({
           time: counterRef.current,
@@ -134,6 +219,40 @@ export default function SignalMonitor({
     });
   }, [subscribe]);
 
+  useEffect(() => {
+    return subscribe(MessageType.SESSION_STARTED, (msg: WSMessage) => {
+      const data = msg.data as unknown as SessionState;
+      activeSessionIdRef.current = data?.sessionId ?? null;
+      resetTimelineSessionData();
+    });
+  }, [resetTimelineSessionData, subscribe]);
+
+  useEffect(() => {
+    return subscribe(MessageType.SESSION_ENDED, () => {
+      activeSessionIdRef.current = null;
+    });
+  }, [subscribe]);
+
+  useEffect(() => {
+    return subscribe(MessageType.SESSION_RECOVERED, (msg: WSMessage) => {
+      const recoveredSessionId = (msg.data as { sessionId?: string | null }).sessionId ?? null;
+      if (!recoveredSessionId) return;
+      activeSessionIdRef.current = recoveredSessionId;
+      const recoveredMessages = (msg.data.messages as unknown as TimelineMessage[]) ?? [];
+      timelineMessagesRef.current = recoveredMessages.map((entry) => ({
+        speaker: entry.speaker,
+        text: entry.text,
+        timestamp: entry.timestamp,
+        turnNumber: entry.turnNumber,
+        sessionId: entry.sessionId ?? recoveredSessionId,
+        questionDroppedAt: entry.questionDroppedAt,
+        chargeScore: entry.chargeScore,
+        bodyMovement: entry.bodyMovement,
+        isAiGenerated: entry.isAiGenerated,
+      }));
+    });
+  }, [subscribe]);
+
   // Subscribe to meter events
   useEffect(() => {
     return subscribe(MessageType.METER_EVENT, (msg: WSMessage) => {
@@ -146,9 +265,20 @@ export default function SignalMonitor({
       const blend = smoothingRef.current / 100;
       const raw = unfiltered + (smoothed - unfiltered) * blend;
       const inverted = -raw; // Invert: squeeze (lower ADC) → line goes up
+      const timestampMs = parseTimestampMs(data.timestamp);
 
       const currentTime = counterRef.current++;
-      bufferRef.current.push({ raw: inverted, time: currentTime });
+      bufferRef.current.push({
+        raw: inverted,
+        time: currentTime,
+        timestampMs,
+        rawSignal: data.rawSignal ?? 0,
+        rawUnfiltered: data.rawUnfiltered ?? 0,
+        toneArm: data.toneArm,
+        position: data.position,
+        needleAction: data.needleAction,
+        confidence: data.confidence,
+      });
 
       // Track all-time min/max
       if (raw > 0) {
@@ -604,13 +734,72 @@ export default function SignalMonitor({
   }, []);
 
   const handleExport = useCallback(() => {
+    const sessionAnchorMs = (() => {
+      const sampleStart = bufferRef.current[0]?.timestampMs;
+      if (sampleStart != null) return sampleStart;
+      if (timelineMessagesRef.current.length > 0) {
+        return parseTimestampMs(timelineMessagesRef.current[0].timestamp);
+      }
+      return Date.now();
+    })();
+
+    const signalTimeline = bufferRef.current.map((point) => ({
+      index: point.time,
+      sessionOffsetSec: (point.timestampMs - sessionAnchorMs) / 1000,
+      timestamp: formatTimestamp(point.timestampMs),
+      signal: point.raw,
+      rawSignal: point.rawSignal,
+      rawUnfiltered: point.rawUnfiltered,
+      toneArm: point.toneArm ?? null,
+      position: point.position ?? null,
+      needleAction: point.needleAction ?? "idle",
+      confidence: point.confidence ?? 0,
+    }));
+
+    const chatTimeline = timelineMessagesRef.current.map((entry) => {
+      const timestampMs = parseTimestampMs(entry.timestamp);
+      return {
+        type: entry.speaker,
+        role:
+          entry.speaker === "auditor" && entry.questionDroppedAt
+            ? "auditor-question"
+            : entry.speaker === "pc"
+              ? "pc-answer"
+              : "auditor-message",
+        turnNumber: entry.turnNumber,
+        text: entry.text,
+        sessionOffsetSec: (timestampMs - sessionAnchorMs) / 1000,
+        timestamp: formatTimestamp(timestampMs),
+        chargeScore: entry.chargeScore ?? null,
+        bodyMovement: entry.bodyMovement ?? null,
+        isAiGenerated: entry.isAiGenerated ?? false,
+      };
+    });
+
     const data = {
       exportedAt: new Date().toISOString(),
       pointsPerSecond: POINTS_PER_SECOND,
-      signal: bufferRef.current,
+      sessionId: activeSessionIdRef.current,
+      sessionAnchor: formatTimestamp(sessionAnchorMs),
+      signal: {
+        pointsPerSecond: POINTS_PER_SECOND,
+        samples: signalTimeline,
+      },
+      timeline: {
+        sessionMessages: chatTimeline,
+        questionMarkers: questionMarkersRef.current.map((marker) => {
+          const markerPoint = bufferRef.current.find((point) => point.time === marker.time);
+          const markerTime = markerPoint?.timestampMs ?? sessionAnchorMs;
+          return {
+            ...marker,
+            sessionOffsetSec: (markerTime - sessionAnchorMs) / 1000,
+            timestamp: formatTimestamp(markerTime),
+          };
+        }),
+        recordingMarkers: markersRef.current,
+        annotations: annotationsRef.current,
+      },
       annotations: annotationsRef.current,
-      questionMarkers: questionMarkersRef.current,
-      recordingMarkers: markersRef.current,
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -673,7 +862,7 @@ export default function SignalMonitor({
   return (
       <div
         className={`w-full ms-panel relative overflow-hidden ${
-        expanded ? "h-[560px]" : "h-[28rem]"
+        expanded ? "h-[560px]" : "flex-1 min-h-0"
       }`}
     >
       <div className="relative flex h-full flex-col">

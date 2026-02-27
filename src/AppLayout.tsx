@@ -2,11 +2,11 @@ import MeterDisplay from "./components/MeterDisplay";
 import SignalMonitor from "./components/SignalMonitor";
 import SessionPanel from "./components/SessionPanel";
 import StatusPanel from "./components/StatusPanel";
-import type { PCProfile, WSMessage } from "./types/messages";
+import type { DBStatus, PCProfile, WSMessage } from "./types/messages";
 
 interface AppLayoutProps {
   connected: boolean;
-  dbStatus?: unknown | null;
+  dbStatus: DBStatus | null;
   send: (type: string, data?: Record<string, unknown>) => string | undefined;
   subscribe: (type: string, handler: (msg: WSMessage) => void) => () => void;
   profiles: PCProfile[];
@@ -26,6 +26,13 @@ interface AppLayoutProps {
   onToggleAnnotations: () => void;
   signalExpanded: boolean;
   setSignalExpanded: (expanded: boolean) => void;
+  audioDevices: MediaDeviceInfo[];
+  audioPermissionError: string | null;
+  showAudioSettings: boolean;
+  setShowAudioSettings: (open: boolean) => void;
+  audioDeviceId: string;
+  onAudioDeviceChange: (deviceId: string) => void;
+  onRefreshAudioDevices: () => void;
 }
 
 export function AppLayout({
@@ -50,11 +57,26 @@ export function AppLayout({
   onToggleAnnotations,
   signalExpanded,
   setSignalExpanded,
+  audioDevices,
+  audioPermissionError,
+  showAudioSettings,
+  setShowAudioSettings,
+  audioDeviceId,
+  onAudioDeviceChange,
+  onRefreshAudioDevices,
 }: AppLayoutProps) {
-  void dbStatus;
+  const aiModel = dbStatus?.aiModel;
+  const aiModelLabel =
+    aiModel === "unavailable (missing ANTHROPIC_API_KEY)"
+      ? "unavailable — Anthropic key missing"
+      : aiModel
+        ? aiModel
+        : connected
+          ? "unavailable"
+          : "disconnected";
 
   return (
-    <div className="mindscope-theme flex flex-col relative ms-app-shell min-h-0 overflow-visible">
+    <div className="mindscope-theme flex flex-col relative ms-app-shell overflow-hidden" style={{ height: "100dvh" }}>
       <div className="ms-bg-orb ms-bg-orb-a" />
       <div className="ms-bg-orb ms-bg-orb-b" />
 
@@ -74,6 +96,17 @@ export function AppLayout({
               {connected ? "Connected" : "Disconnected"}
             </span>
           </div>
+          <div className="ms-chip ms-chip-soft">
+            AI: {aiModelLabel}
+          </div>
+          <button
+            onClick={() => setShowAudioSettings(true)}
+            className="ms-ghost-btn text-xs"
+            type="button"
+            title="Audio settings"
+          >
+            ⚙ Settings
+          </button>
           <button
             onClick={() => setShowManager(!showManager)}
             className="ms-ghost-btn text-xs"
@@ -83,6 +116,54 @@ export function AppLayout({
           </button>
         </div>
       </header>
+
+      {showAudioSettings && (
+        <div className="ms-overlay" role="dialog" aria-modal="true">
+          <div className="relative ms-modal-shell ms-overlay-panel max-w-2xl w-full max-h-[82vh] overflow-y-auto">
+            <div className="ms-modal-header px-3 py-2 flex items-center justify-between border-b border-gray-800">
+              <h2 className="text-sm uppercase tracking-[0.25em] text-cyan-300">Audio Settings</h2>
+              <button
+                onClick={() => setShowAudioSettings(false)}
+                className="ms-ghost-btn text-sm leading-none"
+                aria-label="Close Audio Settings"
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+            <div className="px-4 py-4 space-y-3">
+              <label className="text-xs uppercase tracking-[0.18em] text-gray-400 block">
+                Default microphone for Whisper
+              </label>
+              <div className="flex items-center gap-2">
+                <select
+                  className="ms-select flex-1"
+                  value={audioDeviceId}
+                  onChange={(event) => onAudioDeviceChange(event.target.value)}
+                >
+                  <option value="">System default</option>
+                  {audioDevices.map((device) => (
+                    <option key={device.deviceId} value={device.deviceId}>
+                      {device.label || `Microphone ${device.deviceId.slice(0, 4)}`}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={onRefreshAudioDevices}
+                  className="ms-btn ms-btn-primary px-3 py-1.5"
+                  type="button"
+                >
+                  Refresh
+                </button>
+              </div>
+              {audioPermissionError && (
+                <p className="text-[11px] text-amber-300">{audioPermissionError}</p>
+              )}
+              <p className="text-[11px] text-gray-400">Selected mic ID: {audioDeviceId || "default"}</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showManager && (
         <div className="ms-overlay" role="dialog" aria-modal="true">
@@ -135,18 +216,21 @@ export function AppLayout({
                   {profiles.length} PC{profiles.length === 1 ? "" : "s"}
                 </span>
               </div>
-              <SessionPanel
-                connected={connected}
-                send={send}
-                subscribe={subscribe}
-                profiles={profiles}
-                selectedPcId={selectedPcId}
-                onSelectPc={onSelectPc}
-                sessionMode={sessionMode}
-                onSessionModeChange={onSessionModeChange}
-                sensitivity={sensitivity}
-                toneArm={toneArm}
-              />
+              <div className="flex-1 min-h-0">
+                <SessionPanel
+                  connected={connected}
+                  send={send}
+                  subscribe={subscribe}
+                  profiles={profiles}
+                  selectedPcId={selectedPcId}
+                  onSelectPc={onSelectPc}
+                  sessionMode={sessionMode}
+                  onSessionModeChange={onSessionModeChange}
+                  sensitivity={sensitivity}
+                  toneArm={toneArm}
+                  audioDeviceId={audioDeviceId}
+                />
+              </div>
             </section>
           </div>
         </div>

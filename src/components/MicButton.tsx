@@ -5,17 +5,23 @@ interface MicButtonProps {
   send: (type: string, data?: Record<string, unknown>) => void;
   disabled?: boolean;
   mode: "transcribe" | "send";
+  audioDeviceId?: string;
 }
 
-export default function MicButton({ send, disabled, mode }: MicButtonProps) {
+export default function MicButton({ send, disabled, mode, audioDeviceId }: MicButtonProps) {
   const [recording, setRecording] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
+  const getAudioConstraint = useCallback(() => {
+    if (!audioDeviceId) return true;
+    return { deviceId: { exact: audioDeviceId } } as MediaTrackConstraints;
+  }, [audioDeviceId]);
+
   const startRecording = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: getAudioConstraint() });
       const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
       chunksRef.current = [];
 

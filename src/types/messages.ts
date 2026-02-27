@@ -96,6 +96,7 @@ export interface DBStatus {
   caseFoldersDir: string;
   pcCount: number;
   ready: boolean;
+  aiModel?: string;
   error?: string;
 }
 
@@ -202,6 +203,7 @@ export interface ChatMessage {
   text: string;
   timestamp: string;
   turnNumber: number;
+  sessionId?: string | null;
   needleAction?: NeedleActionType;
   toneArm?: number;
   sensitivity?: number;

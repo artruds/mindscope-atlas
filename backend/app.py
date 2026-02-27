@@ -51,6 +51,12 @@ _load_env_file()
 class MindScopeServer:
     """WebSocket server that bridges React frontend to Python backend."""
 
+    @staticmethod
+    def _ai_model_status(ai_auditor: AIAuditor | None) -> str:
+        if ai_auditor:
+            return ai_auditor.model_name
+        return "unavailable (missing ANTHROPIC_API_KEY)"
+
     def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT):
         self.host = host
         self.port = port
@@ -165,6 +171,9 @@ class MindScopeServer:
 
         # Send init message (include profiles so frontend has them immediately)
         db_status = await self.db.get_status()
+        db_status = dict(db_status)
+        db_status["aiModel"] = self._ai_model_status(self.ai_auditor)
+
         pcs = await self.db.list_pcs()
         init_msg = Message.init(VERSION, db_status)
         init_msg.data["profiles"] = [pc.to_dict() for pc in pcs]

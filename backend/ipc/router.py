@@ -24,6 +24,7 @@ class MessageRouter:
         self.db = db
         self.server = server
         self.ai_auditor = ai_auditor
+        self._starting_session = False
         self._handlers: dict[str, Any] = {
             MessageType.PING.value: self._handle_ping,
             MessageType.PC_CREATE.value: self._handle_pc_create,
@@ -144,6 +145,12 @@ class MessageRouter:
 
     async def _handle_db_status(self, msg: Message) -> Message:
         status = await self.db.get_status()
+        status = dict(status)
+        status["aiModel"] = (
+            self.ai_auditor.model_name
+            if self.ai_auditor
+            else "unavailable (missing ANTHROPIC_API_KEY)"
+        )
         return Message(
             type=MessageType.DB_STATUS_DATA.value,
             data=status,
@@ -154,65 +161,103 @@ class MessageRouter:
 
     async def _handle_session_start(self, msg: Message) -> Message:
         """Start an auditing session for a PC."""
-        pc_id = msg.data.get("pcId", "")
-        if not pc_id:
-            return Message.error("pcId is required", msg.request_id)
+        if self.server and self._starting_session:
+            return Message.error("Session start already in progress", msg.request_id)
 
-        pc = await self.db.get_pc(pc_id)
-        if pc is None:
-            return Message.error(f"PC not found: {pc_id}", msg.request_id)
-
-        if self.server and self.server.active_session:
-            # Auto-end the stale session so the user can start fresh
-            old_sm = self.server.active_session
-            log.warning(
-                "Ending stale session %s before starting new one for PC %s",
-                old_sm.session_id, pc_id,
-            )
-            try:
-                await old_sm.end()
-            except Exception:
-                log.exception("Error ending stale session %s", old_sm.session_id)
-            self.server.active_session = None
-            if self.server.broadcaster:
-                self.server.broadcaster.session_id = None
-
-        # Create session record
-        session = SessionRecord(pc_id=pc_id)
-        session = await self.db.create_session(session)
-
-        # Create and start session manager
-        from ..orchestrator.session_manager import SessionManager, SessionMode
-        session_mode = msg.data.get("sessionMode", SessionMode.STRUCTURED)
-        sm = SessionManager(
-            pc_id=pc_id,
-            session_id=session.id,
-            db=self.db,
-            broadcast_fn=self._broadcast,
-            ai_auditor=self.ai_auditor,
-            session_mode=session_mode,
-        )
-        await sm.start()
-
+        # Serialise session startup so we can't enter SESSION_START twice if users click repeatedly.
         if self.server:
-            self.server.active_session = sm
-            # Link session to broadcaster and reset TA motion
-            if self.server.broadcaster:
-                self.server.broadcaster.session_id = session.id
-                self.server.broadcaster.ta_tracker.reset_session()
-                # Wire charge tracker from broadcaster to session manager
-                sm.charge_tracker = self.server.broadcaster.charge_tracker
+            self._starting_session = True
 
-        return Message(
-            type=MessageType.SESSION_STARTED.value,
-            data={
-                "sessionId": session.id,
-                "pcId": pc_id,
-                "pcName": f"{pc.first_name} {pc.last_name}",
-                **sm.get_state(),
-            },
-            request_id=msg.request_id,
-        )
+        session_id: str | None = None
+        sm = None
+        try:
+            pc_id = msg.data.get("pcId", "")
+            if not pc_id:
+                return Message.error("pcId is required", msg.request_id)
+
+            pc = await self.db.get_pc(pc_id)
+            if pc is None:
+                return Message.error(f"PC not found: {pc_id}", msg.request_id)
+
+            if self.server and self.server.active_session:
+                # Auto-replace any stale active session without emitting a visible closure message.
+                old_sm = self.server.active_session
+                log.warning(
+                    "Ending stale session %s before starting new one for PC %s",
+                    old_sm.session_id, pc_id,
+                )
+                try:
+                    if getattr(old_sm, "db", None) is not None:
+                        await old_sm.db.update_session(
+                            old_sm.pc_id,
+                            old_sm.session_id,
+                            {
+                                "phase": "complete",
+                                "durationSeconds": int(old_sm._elapsed_seconds()),
+                            },
+                        )
+                except Exception:
+                    log.exception("Error ending stale session %s", old_sm.session_id)
+                self.server.active_session = None
+                if self.server.broadcaster:
+                    self.server.broadcaster.session_id = None
+
+            # Create session record
+            session = SessionRecord(pc_id=pc_id)
+            session = await self.db.create_session(session)
+            session_id = session.id
+
+            # Create and start session manager
+            from ..orchestrator.session_manager import SessionManager, SessionMode
+            session_mode = msg.data.get(
+                "sessionMode", msg.data.get("session_mode", SessionMode.STRUCTURED)
+            )
+            if not isinstance(session_mode, str):
+                session_mode = str(session_mode or "").strip()
+            else:
+                session_mode = session_mode.strip()
+            normalized_session_mode = session_mode.lower()
+            if normalized_session_mode not in (SessionMode.CONVERSATIONAL, SessionMode.STRUCTURED):
+                normalized_session_mode = SessionMode.STRUCTURED
+            session_mode = normalized_session_mode
+            sm = SessionManager(
+                pc_id=pc_id,
+                session_id=session.id,
+                db=self.db,
+                broadcast_fn=self._broadcast,
+                ai_auditor=self.ai_auditor,
+                session_mode=session_mode,
+            )
+            if self.server:
+                self.server.active_session = sm
+                # Link session to broadcaster and reset TA motion before first AI call.
+                if self.server.broadcaster:
+                    self.server.broadcaster.session_id = session.id
+                    self.server.broadcaster.ta_tracker.reset_session()
+                    # Wire charge tracker from broadcaster to session manager
+                    sm.charge_tracker = self.server.broadcaster.charge_tracker
+
+            await sm.start()
+            return Message(
+                type=MessageType.SESSION_STARTED.value,
+                data={
+                    "sessionId": session.id,
+                    "pcId": pc_id,
+                    "pcName": f"{pc.first_name} {pc.last_name}",
+                    **sm.get_state(),
+                },
+                request_id=msg.request_id,
+            )
+        except Exception as e:
+            if self.server and self.server.active_session is sm:
+                self.server.active_session = None
+            if self.server and self.server.broadcaster:
+                self.server.broadcaster.session_id = None
+            log.exception("Error starting session %s", session_id or "unknown")
+            raise e
+        finally:
+            if self.server:
+                self._starting_session = False
 
     async def _handle_session_end(self, msg: Message) -> Message:
         """End the active auditing session."""

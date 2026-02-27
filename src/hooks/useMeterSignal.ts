@@ -31,6 +31,8 @@ function isValidNumber(value: unknown): value is number {
 
 export interface MeterSignalOutput {
   displayedAngle: number;
+  displayedAngleRef: React.RefObject<number>;
+  computeFrame: () => void;
   hwConnected: boolean;
   samples: number;
   rawSignalDisplay: number;
@@ -38,7 +40,9 @@ export interface MeterSignalOutput {
   taMotion: TAMotionData | null;
   dataRef: React.RefObject<MeterEventData | null>;
   rawBaselineRef: React.RefObject<number | null>;
-  handleSet: () => void;
+  handleSetDown: () => void;
+  handleSetUp: () => void;
+  handleSetCancel: () => void;
 }
 
 export function useMeterSignal(
@@ -52,8 +56,9 @@ export function useMeterSignal(
   const rawBaselineRef = useRef<number | null>(null);
   const positionBaselineRef = useRef<number | null>(null);
   const displayedAngleRef = useRef(SET_ANGLE);
-  const animRef = useRef<number>(0);
-  const [displayedAngle, setDisplayedAngle] = useState(SET_ANGLE);
+  const calibratedRef = useRef(false);
+  const setTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const setFiredRef = useRef(false);
   const [hwConnected, setHwConnected] = useState(false);
   const [samples, setSamples] = useState(0);
   const [rawSignalDisplay, setRawSignalDisplay] = useState(0);
@@ -73,18 +78,23 @@ export function useMeterSignal(
       }
 
       const raw = parseNumber(d.rawSignal);
-      if (rawBaselineRef.current === null && raw !== null) {
-        rawBaselineRef.current = raw;
-      }
-
       const position = parseNumber(d.position);
-      if (positionBaselineRef.current === null && position !== null) {
-        positionBaselineRef.current = position;
+
+      if (!calibratedRef.current) {
+        if (raw !== null) rawBaselineRef.current = raw;
+        if (position !== null) positionBaselineRef.current = position;
+      } else {
+        if (rawBaselineRef.current === null && raw !== null) {
+          rawBaselineRef.current = raw;
+        }
+        if (positionBaselineRef.current === null && position !== null) {
+          positionBaselineRef.current = position;
+        }
       }
     });
   }, [subscribe]);
 
-  const draw = useCallback(() => {
+  const computeFrame = useCallback(() => {
     const data = dataRef.current;
     const rawSignal = parseNumber(data?.rawSignal);
     const rawUnfiltered = parseNumber(data?.rawUnfiltered) ?? rawSignal;
@@ -112,8 +122,6 @@ export function useMeterSignal(
       : positionBaselineRef.current;
 
     if (!isValidNumber(baseline) || (usingPosition && !isValidNumber(position))) {
-      setDisplayedAngle(displayedAngleRef.current);
-      animRef.current = requestAnimationFrame(draw);
       return;
     }
 
@@ -128,33 +136,65 @@ export function useMeterSignal(
     const clamped = clamp(targetAngle, ARC_MIN, ARC_MAX);
     const damping = 0.02 + blend * 0.23;
     displayedAngleRef.current += (clamped - displayedAngleRef.current) * damping;
-
-    setDisplayedAngle(displayedAngleRef.current);
-    animRef.current = requestAnimationFrame(draw);
   }, [sensitivity, toneArm, smoothing]);
 
-  useEffect(() => {
-    animRef.current = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(animRef.current);
-  }, [draw]);
-
-  const handleSet = useCallback(() => {
-    const raw = parseNumber(dataRef.current?.rawSignal);
-    if (raw === null) {
-      return;
-    }
-    if (rawBaselineRef.current === null) {
-      rawBaselineRef.current = raw;
-      return;
-    }
-
-    const signalDelta = raw - rawBaselineRef.current;
-    const newToneArm = clamp(2.0 + signalDelta / TA_BRIDGE_FACTOR, 0, 6);
-    onToneArmChange(newToneArm);
+  const handleSetDown = useCallback(() => {
+    setFiredRef.current = false;
+    setTimerRef.current = setTimeout(() => {
+      setFiredRef.current = true;
+      const raw = parseNumber(dataRef.current?.rawSignal);
+      const position = parseNumber(dataRef.current?.position);
+      calibratedRef.current = false;
+      if (raw !== null) rawBaselineRef.current = raw;
+      if (position !== null) positionBaselineRef.current = position;
+      calibratedRef.current = true;
+      onToneArmChange(2.0);
+      displayedAngleRef.current = SET_ANGLE;
+    }, 2000);
   }, [onToneArmChange]);
 
+  const handleSetUp = useCallback(() => {
+    if (setTimerRef.current !== null) {
+      clearTimeout(setTimerRef.current);
+      setTimerRef.current = null;
+    }
+    if (setFiredRef.current) return;
+
+    const raw = parseNumber(dataRef.current?.rawSignal);
+    if (raw === null) return;
+
+    if (!calibratedRef.current) {
+      calibratedRef.current = true;
+      rawBaselineRef.current = raw;
+      const position = parseNumber(dataRef.current?.position);
+      if (position !== null) positionBaselineRef.current = position;
+      onToneArmChange(2.0);
+      displayedAngleRef.current = SET_ANGLE;
+    } else {
+      if (rawBaselineRef.current === null) return;
+      const signalDelta = raw - rawBaselineRef.current;
+      const newToneArm = clamp(2.0 + signalDelta / TA_BRIDGE_FACTOR, 0, 6);
+      onToneArmChange(newToneArm);
+    }
+  }, [onToneArmChange]);
+
+  const handleSetCancel = useCallback(() => {
+    if (setTimerRef.current !== null) {
+      clearTimeout(setTimerRef.current);
+      setTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (setTimerRef.current !== null) clearTimeout(setTimerRef.current);
+    };
+  }, []);
+
   return {
-    displayedAngle,
+    displayedAngle: displayedAngleRef.current,
+    displayedAngleRef,
+    computeFrame,
     hwConnected,
     samples,
     rawSignalDisplay,
@@ -162,6 +202,8 @@ export function useMeterSignal(
     taMotion,
     dataRef,
     rawBaselineRef,
-    handleSet,
+    handleSetDown,
+    handleSetUp,
+    handleSetCancel,
   };
 }

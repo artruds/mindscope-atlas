@@ -14,7 +14,7 @@ import { formatTime } from "../utils";
 
 interface SessionPanelProps {
   connected: boolean;
-  send: (type: string, data?: Record<string, unknown>) => void;
+  send: (type: string, data?: Record<string, unknown>) => string | undefined;
   subscribe: (type: string, handler: (msg: WSMessage) => void) => () => void;
   profiles: PCProfile[];
   selectedPcId: string;
@@ -23,6 +23,16 @@ interface SessionPanelProps {
   onSessionModeChange: (mode: SessionMode) => void;
   sensitivity: number;
   toneArm: number;
+  audioDeviceId?: string;
+}
+
+const LAST_SESSION_MAP_KEY = "mindscope_lastSessionByPc";
+
+interface SessionSnapshot {
+  sessionId: string;
+  pcId: string;
+  messages: ChatMessage[];
+  sessionState?: SessionState;
 }
 
 const PHASE_COLORS: Record<string, string> = {
@@ -32,6 +42,7 @@ const PHASE_COLORS: Record<string, string> = {
   END_RUDIMENTS: "bg-amber-600",
   COMPLETE: "bg-gray-500",
 };
+const START_SESSION_TIMEOUT_MS = 30000;
 
 export default function SessionPanel({
   connected,
@@ -44,29 +55,102 @@ export default function SessionPanel({
   onSessionModeChange,
   sensitivity,
   toneArm,
+  audioDeviceId,
 }: SessionPanelProps) {
   const [sessionState, setSessionState] = useState<SessionState | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isStarting, setIsStarting] = useState(false);
   const [isAiTyping, setIsAiTyping] = useState(false);
   const [pcInput, setPcInput] = useState("");
   const [autoRecord, setAutoRecord] = useState(false);
   const [isAutoRecording, setIsAutoRecording] = useState(false);
   const [autoSend, setAutoSend] = useState(false);
   const [chargeMap, setChargeMap] = useState<ChargeMapEntry[]>([]);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const autoSendTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const [showChargeMap, setShowChargeMap] = useState(false);
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const autoSendTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const autoRecorderRef = useRef<MediaRecorder | null>(null);
   const autoStreamRef = useRef<MediaStream | null>(null);
   const autoChunksRef = useRef<Blob[]>([]);
   const sessionStateRef = useRef(sessionState);
   sessionStateRef.current = sessionState;
+  const activeSessionIdRef = useRef<string | null>(null);
+  const isStartingSessionRef = useRef(false);
+  const startupTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const startupChatBufferRef = useRef<ChatMessage[]>([]);
   const autoRecordRef = useRef(autoRecord);
   autoRecordRef.current = autoRecord;
+
+  const addChatMessage = useCallback((msg: ChatMessage) => {
+    setMessages((prev) => {
+      if (prev.some((m) => m.turnNumber === msg.turnNumber
+          && m.speaker === msg.speaker
+          && m.text === msg.text
+          && (m.sessionId ?? null) === (msg.sessionId ?? null))) {
+        return prev;
+      }
+      return [...prev, msg];
+    });
+  }, []);
+
+  const flushStartupChatBuffer = useCallback((sessionId: string | null) => {
+    if (!sessionId) return;
+    const queued = startupChatBufferRef.current.filter((msg) => (msg.sessionId ?? null) === sessionId);
+    if (queued.length === 0) return;
+    startupChatBufferRef.current = [];
+    setMessages((prev) => {
+      const merged = [...prev];
+      queued.forEach((msg) => {
+        if (merged.some((m) => m.turnNumber === msg.turnNumber
+          && m.speaker === msg.speaker
+          && m.text === msg.text
+          && (m.sessionId ?? null) === (msg.sessionId ?? null))) {
+          return;
+        }
+        merged.push(msg);
+      });
+      return merged;
+    });
+  }, []);
+
+  const restoreKey = `mindscope_sessionSnapshot_${selectedPcId || "default"}`;
+
+  const getSessionMap = useCallback((): Record<string, string> => {
+    try {
+      const raw = localStorage.getItem(LAST_SESSION_MAP_KEY);
+      if (!raw) return {};
+      return JSON.parse(raw) as Record<string, string>;
+    } catch {
+      return {};
+    }
+  }, []);
+
+  const setSessionMapValue = useCallback((pcId: string, sessionId: string) => {
+    const map = getSessionMap();
+    map[pcId] = sessionId;
+    localStorage.setItem(LAST_SESSION_MAP_KEY, JSON.stringify(map));
+    localStorage.setItem("mindscope_lastSessionId", sessionId);
+    localStorage.setItem("mindscope_lastPcId", pcId);
+  }, [getSessionMap]);
+
+  const saveSnapshot = useCallback(() => {
+    if (!selectedPcId || !sessionState?.sessionId) return;
+    const snapshot: SessionSnapshot = {
+      sessionId: sessionState.sessionId,
+      pcId: selectedPcId,
+      messages,
+      sessionState,
+    };
+    localStorage.setItem(restoreKey, JSON.stringify(snapshot));
+  }, [messages, restoreKey, selectedPcId, sessionState]);
 
   const startAutoRecording = useCallback(async () => {
     if (autoRecorderRef.current) return; // already recording
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: audioDeviceId ? ({ deviceId: { exact: audioDeviceId } } as MediaTrackConstraints) : true,
+      });
       const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
       autoChunksRef.current = [];
       recorder.ondataavailable = (e) => {
@@ -79,7 +163,7 @@ export default function SessionPanel({
     } catch (err) {
       console.error("[AutoRecord] Failed to start:", err);
     }
-  }, []);
+  }, [audioDeviceId]);
 
   const stopAutoRecording = useCallback(async (): Promise<string | null> => {
     const recorder = autoRecorderRef.current;
@@ -131,20 +215,60 @@ export default function SessionPanel({
   useEffect(() => {
     const unsubs = [
       subscribe(MessageType.SESSION_STATE, (msg) => {
-        setSessionState(msg.data as unknown as SessionState);
+        const state = msg.data as unknown as SessionState;
+        if (activeSessionIdRef.current && state.sessionId !== activeSessionIdRef.current) {
+          return;
+        }
+        if (state.sessionId) {
+          activeSessionIdRef.current = state.sessionId;
+        }
+        setSessionState(state);
       }),
       subscribe(MessageType.SESSION_STARTED, (msg) => {
         const state = msg.data as unknown as SessionState;
+        if (
+          activeSessionIdRef.current &&
+          state.sessionId &&
+          state.sessionId !== activeSessionIdRef.current
+        ) {
+          return;
+        }
+        setIsStarting(false);
+        isStartingSessionRef.current = false;
+        if (startupTimeoutRef.current) {
+          clearTimeout(startupTimeoutRef.current);
+          startupTimeoutRef.current = undefined;
+        }
+        setIsAiTyping(false);
         if (state.sessionMode) {
           onSessionModeChange(state.sessionMode);
         }
+        if (state.sessionId) {
+          activeSessionIdRef.current = state.sessionId;
+          flushStartupChatBuffer(state.sessionId);
+        }
         setSessionState(state);
+        if (state.pcId) {
+          setSessionMapValue(state.pcId, state.sessionId);
+        }
         // Save to localStorage for recovery
         localStorage.setItem("mindscope_lastSessionId", state.sessionId);
         localStorage.setItem("mindscope_lastPcId", state.pcId);
         // Don't clear messages here — they were pre-cleared in handleStart
       }),
       subscribe(MessageType.SESSION_ENDED, () => {
+        setIsStarting(false);
+        isStartingSessionRef.current = false;
+        startupChatBufferRef.current = [];
+        if (startupTimeoutRef.current) {
+          clearTimeout(startupTimeoutRef.current);
+          startupTimeoutRef.current = undefined;
+        }
+        activeSessionIdRef.current = null;
+        if (typingTimeoutRef.current) {
+          clearTimeout(typingTimeoutRef.current);
+          typingTimeoutRef.current = undefined;
+        }
         setSessionState(null);
         setIsAiTyping(false);
         setChargeMap([]);
@@ -152,22 +276,47 @@ export default function SessionPanel({
         localStorage.removeItem("mindscope_lastPcId");
       }),
       subscribe(MessageType.SESSION_PAUSED, (msg) => {
-        setSessionState(msg.data as unknown as SessionState);
+        const state = msg.data as unknown as SessionState;
+        if (state.sessionId && state.sessionId !== activeSessionIdRef.current) {
+          return;
+        }
+        setSessionState(state);
       }),
       subscribe(MessageType.SESSION_RESUMED, (msg) => {
-        setSessionState(msg.data as unknown as SessionState);
+        const state = msg.data as unknown as SessionState;
+        if (state.sessionId && state.sessionId !== activeSessionIdRef.current) {
+          return;
+        }
+        setSessionState(state);
       }),
       subscribe(MessageType.CHAT_MESSAGE, (msg) => {
         const chatMsg = msg.data as unknown as ChatMessage;
-        if (chatMsg) {
-          setMessages((prev) => {
-            // Skip if duplicate (same turn + speaker + text)
-            if (prev.some((m) => m.turnNumber === chatMsg.turnNumber
-                && m.speaker === chatMsg.speaker && m.text === chatMsg.text)) {
-              return prev;
+        if (!chatMsg) {
+          return;
+        }
+        const chatSessionId = chatMsg.sessionId ?? null;
+
+        if (chatSessionId) {
+          if (activeSessionIdRef.current && chatSessionId !== activeSessionIdRef.current) {
+            return;
+          }
+          if (!activeSessionIdRef.current) {
+            if (isStartingSessionRef.current) {
+              startupChatBufferRef.current = [...startupChatBufferRef.current, chatMsg];
+              return;
             }
-            return [...prev, chatMsg];
-          });
+            activeSessionIdRef.current = chatSessionId;
+          }
+        } else if (!isStartingSessionRef.current && !activeSessionIdRef.current) {
+          return;
+        }
+
+        if (chatMsg) {
+          if (typingTimeoutRef.current) {
+            clearTimeout(typingTimeoutRef.current);
+            typingTimeoutRef.current = undefined;
+          }
+          addChatMessage(chatMsg);
           setIsAiTyping(false);
 
           // Auto-record: start recording when auditor speaks during PROCESSING
@@ -181,13 +330,42 @@ export default function SessionPanel({
         }
       }),
       subscribe(MessageType.CHAT_TYPING, () => {
+        if (!activeSessionIdRef.current && !isStartingSessionRef.current) {
+          return;
+        }
         setIsAiTyping(true);
+        if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = setTimeout(() => {
+          setIsAiTyping(false);
+        }, 12000);
       }),
       subscribe(MessageType.AUDIO_TRANSCRIBED, (msg) => {
         // Only fill input box for transcribe-only mode (autoSent === false)
         if (msg.data.autoSent === false) {
           const text = msg.data.text as string;
           if (text) setPcInput(text);
+        }
+      }),
+      subscribe(MessageType.ERROR, (msg) => {
+        setIsStarting(false);
+        isStartingSessionRef.current = false;
+        startupChatBufferRef.current = [];
+        if (startupTimeoutRef.current) {
+          clearTimeout(startupTimeoutRef.current);
+          startupTimeoutRef.current = undefined;
+        }
+        const errorMessage = (msg?.data as { message?: string } | undefined)?.message;
+        if (errorMessage && errorMessage.trim()) {
+          addChatMessage({
+            speaker: "auditor",
+            text: `Error: ${errorMessage}`,
+            timestamp: new Date().toISOString(),
+            turnNumber: sessionStateRef.current?.turnNumber
+              ? sessionStateRef.current.turnNumber + 1
+              : 0,
+            isAiGenerated: false,
+          });
+          setIsAiTyping(false);
         }
       }),
       subscribe(MessageType.CHARGE_MAP, (msg) => {
@@ -199,41 +377,141 @@ export default function SessionPanel({
         if (recovered.length > 0) {
           setMessages(recovered);
         }
-        // Restore session state so UI shows the session as active
         const recoveredState = msg.data.sessionState as unknown as SessionState | undefined;
         if (recoveredState) {
+          activeSessionIdRef.current = recoveredState.sessionId;
           setSessionState(recoveredState);
+          if (recoveredState.pcId) {
+            setSessionMapValue(recoveredState.pcId, recoveredState.sessionId);
+          }
+        } else {
+          setSessionState(null);
         }
       }),
     ];
-    return () => unsubs.forEach((u) => u());
-  }, [subscribe, startAutoRecording, onSessionModeChange]);
+    return () => {
+      unsubs.forEach((u) => u());
+        if (typingTimeoutRef.current) {
+          clearTimeout(typingTimeoutRef.current);
+          typingTimeoutRef.current = undefined;
+        }
+        if (startupTimeoutRef.current) {
+        clearTimeout(startupTimeoutRef.current);
+        startupTimeoutRef.current = undefined;
+      }
+    };
+  }, [
+    addChatMessage,
+    flushStartupChatBuffer,
+    onSessionModeChange,
+    setSessionMapValue,
+    startAutoRecording,
+    subscribe,
+  ]);
 
   // Attempt session recovery on mount
   useEffect(() => {
-    if (!connected) return;
-    const lastSessionId = localStorage.getItem("mindscope_lastSessionId");
-    const lastPcId = localStorage.getItem("mindscope_lastPcId");
-    if (lastSessionId && lastPcId) {
-      send(MessageType.SESSION_RECOVER, { sessionId: lastSessionId, pcId: lastPcId });
+    if (!connected || !selectedPcId) return;
+
+    const sessionMap = getSessionMap();
+    const sessionId = sessionMap[selectedPcId]
+      || (localStorage.getItem("mindscope_lastPcId") === selectedPcId
+        ? localStorage.getItem("mindscope_lastSessionId")
+        : null);
+
+    if (sessionId) {
+      send(MessageType.SESSION_RECOVER, { sessionId, pcId: selectedPcId });
+      return;
     }
-  }, [connected, send]);
+
+    const snapshotRaw = localStorage.getItem(restoreKey);
+    if (!snapshotRaw) return;
+    try {
+      const snapshot = JSON.parse(snapshotRaw) as SessionSnapshot;
+      if (snapshot?.pcId === selectedPcId) {
+        const recovered = snapshot.messages ?? [];
+        if (recovered.length > 0) {
+          setMessages(recovered);
+        }
+      }
+    } catch {
+      localStorage.removeItem(restoreKey);
+    }
+  }, [connected, getSessionMap, restoreKey, selectedPcId, send]);
+
+  // Persist latest transcript/session state so conversations survive app restarts
+  useEffect(() => {
+    saveSnapshot();
+  }, [saveSnapshot]);
+
+  useEffect(() => {
+    setMessages([]);
+    setSessionState(null);
+    setChargeMap([]);
+    activeSessionIdRef.current = null;
+  }, [selectedPcId]);
 
   // Auto-scroll messages
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const container = messagesScrollRef.current;
+    if (!container) return;
+
+    // Keep scrolling constrained to the chat panel, not the whole page.
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const nearBottom = distanceFromBottom < 140;
+    if (!nearBottom && messages.length > 0) return;
+
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: "smooth",
+    });
   }, [messages, isAiTyping]);
+
+  const isActive = sessionState !== null && sessionState.phase !== "COMPLETE";
 
   const handleStart = useCallback(() => {
     if (!selectedPcId) return;
+    if (isStarting || isActive || isStartingSessionRef.current) return;
+    setIsStarting(true);
+    setIsAiTyping(true);
+    isStartingSessionRef.current = true;
+    activeSessionIdRef.current = null;
+    startupChatBufferRef.current = [];
     setMessages([]);       // clear BEFORE sending
     setChargeMap([]);
-    setIsAiTyping(false);
-    send(MessageType.SESSION_START, {
+    setShowChargeMap(false);
+    setPcInput("");
+    if (autoSendTimerRef.current) {
+      clearTimeout(autoSendTimerRef.current);
+      autoSendTimerRef.current = undefined;
+    }
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = undefined;
+    }
+    if (startupTimeoutRef.current) {
+      clearTimeout(startupTimeoutRef.current);
+      startupTimeoutRef.current = undefined;
+    }
+    startupTimeoutRef.current = setTimeout(() => {
+      if (!isStartingSessionRef.current) return;
+      setIsStarting(false);
+      isStartingSessionRef.current = false;
+      setIsAiTyping(false);
+    }, START_SESSION_TIMEOUT_MS);
+    const requestId = send(MessageType.SESSION_START, {
       pcId: selectedPcId,
       sessionMode,
     });
-  }, [selectedPcId, send, sessionMode]);
+    if (!requestId) {
+      setIsStarting(false);
+      isStartingSessionRef.current = false;
+      if (startupTimeoutRef.current) {
+        clearTimeout(startupTimeoutRef.current);
+        startupTimeoutRef.current = undefined;
+      }
+    }
+  }, [selectedPcId, send, sessionMode, isActive, isStarting]);
 
   const handleEnd = useCallback(() => {
     send(MessageType.SESSION_END);
@@ -287,12 +565,11 @@ export default function SessionPanel({
     // Transcription will arrive via AUDIO_TRANSCRIBED → fills pcInput
   }, [stopAutoRecording]);
 
-  const isActive = sessionState !== null && sessionState.phase !== "COMPLETE";
   const effectiveSessionMode = sessionState?.sessionMode ?? sessionMode;
   const selectedPc = profiles.find((pc) => pc.id === selectedPcId) ?? null;
 
   return (
-    <div className="flex flex-col h-full gap-3">
+    <div className="flex flex-col h-full min-h-0 gap-3">
       {/* Controls */}
       <div className="ms-panel p-4 overflow-hidden">
         <div className="ms-session-toolbar mb-3">
@@ -301,7 +578,8 @@ export default function SessionPanel({
               type="button"
               onClick={() => onSessionModeChange("structured")}
               disabled={isActive}
-              className={`ms-mini-btn ms-segment-btn ${effectiveSessionMode === "structured" ? "bg-cyan-500 text-black" : "text-cyan-200"}`}
+              aria-pressed={effectiveSessionMode === "structured"}
+              className="ms-mini-btn ms-segment-btn"
             >
               Structured
             </button>
@@ -309,7 +587,8 @@ export default function SessionPanel({
               type="button"
               onClick={() => onSessionModeChange("conversational")}
               disabled={isActive}
-              className={`ms-mini-btn ms-segment-btn ${effectiveSessionMode === "conversational" ? "bg-cyan-500 text-black" : "text-cyan-200"}`}
+              aria-pressed={effectiveSessionMode === "conversational"}
+              className="ms-mini-btn ms-segment-btn"
             >
               Conversational
             </button>
@@ -332,7 +611,7 @@ export default function SessionPanel({
           {!isActive ? (
             <button
               onClick={handleStart}
-              disabled={!connected || !selectedPcId}
+              disabled={!connected || !selectedPcId || isStarting || isStartingSessionRef.current}
               className="ms-btn ms-btn-emerald ms-pill ms-toolbar-cta"
             >
               Start Session
@@ -414,7 +693,7 @@ export default function SessionPanel({
 
       {/* Chat messages */}
       <div className="flex-1 min-h-0 ms-panel flex flex-col">
-        <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2 ms-scroll">
+        <div ref={messagesScrollRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-2 ms-scroll">
             {messages.length === 0 && !isActive ? (
               <div className="h-full min-h-0 flex items-center justify-center">
               <div className="ms-empty-state max-w-md w-full text-center px-6 py-8">
@@ -450,6 +729,18 @@ export default function SessionPanel({
           )}
 
           {chargeMap.length > 0 && (
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowChargeMap((v) => !v)}
+                className="text-[11px] border border-gray-600/70 rounded-full px-2.5 py-1 text-gray-300 hover:text-white hover:border-gray-400 transition-colors"
+              >
+                {showChargeMap ? "Hide Charge Map" : "Show Charge Map"}
+              </button>
+            </div>
+          )}
+
+          {showChargeMap && chargeMap.length > 0 && (
             <div className="space-y-2">
               <div className="text-[11px] uppercase tracking-[0.2em] text-gray-400">Charge Map</div>
               <div className="max-h-28 overflow-y-auto space-y-1 pr-1">
@@ -468,12 +759,11 @@ export default function SessionPanel({
             </div>
           )}
 
-          <div ref={messagesEndRef} />
         </div>
 
         {/* Input area */}
         {isActive && !sessionState?.isPaused && (
-          <div className="px-3 pb-3 pt-1 border-t border-gray-800 space-y-2">
+          <div className="px-3 pb-3 pt-1 border-t border-gray-800 space-y-2 shrink-0">
             {/* Auto-recording indicator + submit */}
             {isAutoRecording && (
               <div className="flex items-center gap-2">
@@ -509,8 +799,8 @@ export default function SessionPanel({
                       : "border-gray-700 focus:border-indigo-500"
                 }`}
               />
-              <MicButton send={send} disabled={!isActive} mode="transcribe" />
-              <MicButton send={send} disabled={!isActive} mode="send" />
+              <MicButton send={send} disabled={!isActive} mode="transcribe" audioDeviceId={audioDeviceId} />
+              <MicButton send={send} disabled={!isActive} mode="send" audioDeviceId={audioDeviceId} />
               <button
                 onClick={handlePcInput}
                 disabled={!pcInput.trim()}

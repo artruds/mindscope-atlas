@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { WSMessage } from "../types/messages";
 import {
   ARC_MAX,
@@ -20,7 +20,7 @@ interface MeterDisplayProps {
 
 const SENSITIVITY_STEPS = [1, 2, 4, 8, 16, 32, 64, 128];
 const SMOOTHING_STEPS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
-const TONE_ARM_STEPS = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0];
+const TONE_ARM_STEPS = Array.from({ length: 31 }, (_, i) => Number((i * 0.2).toFixed(1)));
 
 export default function MeterDisplay({
   subscribe,
@@ -34,13 +34,16 @@ export default function MeterDisplay({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animRef = useRef<number>(0);
   const {
-    displayedAngle,
+    displayedAngleRef,
+    computeFrame,
     hwConnected,
     samples,
     rawSignalDisplay,
     needleAction,
     taMotion,
-    handleSet,
+    handleSetDown,
+    handleSetUp,
+    handleSetCancel,
   } = useMeterSignal(subscribe, sensitivity, toneArm, smoothing, onToneArmChange);
 
   const adjustSensitivity = useCallback((delta: number) => {
@@ -67,7 +70,49 @@ export default function MeterDisplay({
     onToneArmChange(next);
   }, [toneArm, onToneArmChange]);
 
+  const [setHolding, setSetHolding] = useState(false);
+  const [calibratedFlash, setCalibratedFlash] = useState(false);
+  const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const onSetDown = useCallback(() => {
+    handleSetDown();
+    setSetHolding(true);
+    holdTimerRef.current = setTimeout(() => {
+      setSetHolding(false);
+      setCalibratedFlash(true);
+      flashTimerRef.current = setTimeout(() => setCalibratedFlash(false), 1200);
+    }, 2000);
+  }, [handleSetDown]);
+
+  const onSetUp = useCallback(() => {
+    handleSetUp();
+    setSetHolding(false);
+    if (holdTimerRef.current !== null) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+  }, [handleSetUp]);
+
+  const onSetLeave = useCallback(() => {
+    handleSetCancel();
+    setSetHolding(false);
+    if (holdTimerRef.current !== null) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+  }, [handleSetCancel]);
+
+  useEffect(() => {
+    return () => {
+      if (holdTimerRef.current !== null) clearTimeout(holdTimerRef.current);
+      if (flashTimerRef.current !== null) clearTimeout(flashTimerRef.current);
+    };
+  }, []);
+
   const draw = useCallback(() => {
+    computeFrame();
+
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -186,7 +231,7 @@ export default function MeterDisplay({
     ctx.fillText("TEST", cx + labelR * Math.cos(testRad), arcCenterY + labelR * Math.sin(testRad));
 
     // Needle
-    const needleRad = degToRad(displayedAngle - 90);
+    const needleRad = degToRad(displayedAngleRef.current - 90);
     const x2 = cx + needleLen * Math.cos(needleRad);
     const y2 = pivotY + needleLen * Math.sin(needleRad);
 
@@ -364,10 +409,18 @@ export default function MeterDisplay({
           </div>
 
           <button
-            onClick={handleSet}
-            className="ms-btn ms-btn-emerald py-2 lg:min-w-[9.5rem] lg:px-6"
+            onMouseDown={onSetDown}
+            onMouseUp={onSetUp}
+            onMouseLeave={onSetLeave}
+            onTouchStart={(e) => { e.preventDefault(); onSetDown(); }}
+            onTouchEnd={(e) => { e.preventDefault(); onSetUp(); }}
+            onTouchCancel={onSetLeave}
+            onContextMenu={(e) => e.preventDefault()}
+            className={`ms-btn ms-btn-emerald py-2 lg:min-w-[9.5rem] lg:px-6 transition-all duration-150 select-none${
+              setHolding ? " scale-105 brightness-125" : ""
+            }${calibratedFlash ? " ring-2 ring-emerald-400" : ""}`}
           >
-            SET
+            {calibratedFlash ? "CALIBRATED" : "SET"}
           </button>
         </div>
       </div>
