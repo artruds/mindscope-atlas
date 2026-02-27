@@ -10,3 +10,4 @@ backend/**/__pycache__/
 *.db-shm
 .env
 backend/.env
+mindscope-atlas-share-*.zip
