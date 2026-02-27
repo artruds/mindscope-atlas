@@ -9,6 +9,7 @@ DATE_TAG="$(date +%Y%m%d-%H%M%S)"
 ARCHIVE_NAME="mindscope-atlas-share-${DATE_TAG}"
 ARCHIVE_PATH="${PROJECT_ROOT}/${ARCHIVE_NAME}.zip"
 TMP_DIR="$(mktemp -d)"
+TMP_SRC_DIR="$TMP_DIR/$ARCHIVE_NAME"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 if ! command -v git >/dev/null 2>&1; then
@@ -26,11 +27,12 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
+mkdir -p "$TMP_SRC_DIR"
 echo "Creating package from current HEAD..."
-git archive --format=tar HEAD | tar -x -C "$TMP_DIR"
+git archive --format=tar HEAD | tar -x -C "$TMP_SRC_DIR"
 
 echo "Creating zip: $ARCHIVE_PATH"
-(cd "$TMP_DIR" && zip -qr "$ARCHIVE_PATH" .)
+(cd "$TMP_DIR" && zip -qr "$ARCHIVE_PATH" "$ARCHIVE_NAME")
 
 echo "Done. Share this file with your friend:"
 echo "$ARCHIVE_PATH"
